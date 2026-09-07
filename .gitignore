@@ -30,3 +30,13 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Build output
+/bin/
+/out/
+
+# Local Aerospike data (compose uses a named volume, but keep stray files out)
+deploy/data/
+
+# Local compose overrides (see deploy/.env.example)
+deploy/.env

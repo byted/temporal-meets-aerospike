@@ -1,0 +1,177 @@
+name: temporal-meets-aerospike
+
+# Operational persistence: Aerospike.  Visibility: Elasticsearch.
+#
+# Two facts drive the shape of this file:
+#
+#   1. An Aerospike strong-consistency namespace serves nothing until a roster
+#      has been staged and the cluster reclustered.  That is a manual, one-shot
+#      step, so it gets its own init container that the server waits on.
+#
+#   2. The Temporal Web UI is a separate binary (temporalio/ui-server).  Only
+#      `temporal server start-dev` bundles it into one process, and that path
+#      cannot take a custom persistence factory.  So it is its own service.
+#
+#   3. `platform: ${TMA_PLATFORM:-}` on every service.  Empty by default, so
+#      Docker picks the host architecture and this is a no-op.  It exists
+#      because a DOCKER_DEFAULT_PLATFORM in your shell overrides the host
+#      default for every container -- see deploy/.env.example.  Applied
+#      uniformly on purpose: a stack with an arm64 database and an emulated
+#      amd64 server would still work, and would quietly produce nonsense
+#      performance numbers.  All six images publish amd64 and arm64.
+
+services:
+  aerospike:
+    image: aerospike/aerospike-server-enterprise:8.1.2.4
+    platform: ${TMA_PLATFORM:-}
+    container_name: tma-aerospike
+    command: ["--config-file", "/opt/aerospike/etc/aerospike.conf"]
+    volumes:
+      - ./aerospike.conf:/opt/aerospike/etc/aerospike.conf:ro
+      - aerospike-data:/opt/aerospike/data
+    ports:
+      - "3000:3000"   # client
+      - "3001:3001"   # fabric
+      - "3002:3002"   # heartbeat
+      - "3003:3003"   # admin
+    healthcheck:
+      # Deliberately a bare TCP probe rather than `asinfo -v build`: asinfo is a
+      # Python program and takes ~6s to start under qemu emulation, which blows
+      # any sane timeout and flaps the container to unhealthy long after it came
+      # up.  This costs ~0.3s and proves the client port is accepting.
+      #
+      # It does NOT prove the SC namespace is available -- nothing here can.
+      # roster-init is the real readiness gate, and it has its own retry loop.
+      # CMD+bash, not CMD-SHELL: /bin/sh in this image is dash, which has
+      # no /dev/tcp -- that is a bash builtin.
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    networks: [tma]
+
+  roster-init:
+    image: aerospike/aerospike-tools:13.0.3
+    platform: ${TMA_PLATFORM:-}
+    container_name: tma-roster-init
+    depends_on:
+      aerospike:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        echo "staging roster for namespace 'temporal'..."
+        asadm -h aerospike -e "enable; manage roster stage observed ns temporal"
+        asadm -h aerospike -e "enable; manage recluster"
+
+        # recluster is asynchronous.  Do not report success until every
+        # partition is actually available, or the server will start against a
+        # namespace that rejects reads and writes.
+        # NB: `grep -x ... > /dev/null`, never `grep -qx`.  Under `pipefail`,
+        # `grep -q` exits on its first match, `tr` then dies of SIGPIPE (141),
+        # and the pipeline reports failure even though the match succeeded.
+        for _ in $$(seq 1 30); do
+          if asinfo -h aerospike -v "namespace/temporal" \
+               | tr ';' '\n' | grep -x 'unavailable_partitions=0' > /dev/null; then
+            echo "namespace 'temporal': all 4096 partitions available"
+            asadm -h aerospike -e "enable; show roster"
+            exit 0
+          fi
+          sleep 1
+        done
+
+        echo "ERROR: namespace 'temporal' still has unavailable partitions" >&2
+        asinfo -h aerospike -v "namespace/temporal" \
+          | tr ';' '\n' | grep -E 'unavailable|dead|strong-consistency' >&2
+        exit 1
+    networks: [tma]
+
+  elasticsearch:
+    image: elasticsearch:7.17.28
+    platform: ${TMA_PLATFORM:-}
+    container_name: tma-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms256m -Xmx256m
+      - xpack.security.enabled=false
+      - cluster.routing.allocation.disk.threshold_enabled=false
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    networks: [tma]
+
+  es-init:
+    # Uses Temporal's own schema tool at the matching server version rather
+    # than hand-rolled curl, so the index template tracks the server release.
+    image: temporalio/admin-tools:1.31.2
+    platform: ${TMA_PLATFORM:-}
+    container_name: tma-es-init
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    # /bin/sh, not /bin/bash: the admin-tools image has no bash.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        export ES_SERVER=http://elasticsearch:9200
+        temporal-elasticsearch-tool setup-schema
+        # `--fail` is the tool's own idempotency switch -- despite the name it
+        # means "fail silently on HTTP errors", so re-running compose is safe.
+        temporal-elasticsearch-tool create-index --index "$${ES_VISIBILITY_INDEX}" --fail
+        echo "elasticsearch visibility index '$${ES_VISIBILITY_INDEX}' ready"
+    environment:
+      - ES_VISIBILITY_INDEX=temporal_visibility_v1_dev
+    networks: [tma]
+
+  temporal:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: temporal-meets-aerospike/server:dev
+    platform: ${TMA_PLATFORM:-}
+    container_name: tma-temporal
+    depends_on:
+      roster-init:
+        condition: service_completed_successfully
+      es-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./temporal.yaml:/etc/temporal/config/temporal.yaml:ro
+    ports:
+      - "7233:7233"   # frontend gRPC
+      - "7243:7243"   # frontend HTTP
+    healthcheck:
+      test: ["CMD-SHELL", "temporal-aerospike-server --help > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks: [tma]
+
+  ui:
+    image: temporalio/ui:2.53.3
+    platform: ${TMA_PLATFORM:-}
+    container_name: tma-ui
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:8080
+    ports:
+      - "8080:8080"
+    networks: [tma]
+
+volumes:
+  aerospike-data:
+
+networks:
+  tma:
+    driver: bridge

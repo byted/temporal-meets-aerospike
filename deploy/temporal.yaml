@@ -1,0 +1,92 @@
+# Temporal Server configuration for the Aerospike PoC.
+#
+# The only unusual part is the `customDatastore` block: Temporal dispatches on
+# the *presence* of that key (common/persistence/client/fx.go), not on its
+# `name`, and hands the whole thing to whatever AbstractDataStoreFactory the
+# binary registered via temporal.WithCustomDataStoreFactory().  Exactly one
+# custom datastore factory can exist per process.
+
+log:
+  stdout: true
+  level: info
+
+persistence:
+  defaultStore: aerospike-default
+  visibilityStore: es-visibility
+
+  # Immutable after the first run.  Kept small deliberately: the PoC is about
+  # correctness of the mapping, not scale.
+  numHistoryShards: 4
+
+  datastores:
+    aerospike-default:
+      customDatastore:
+        name: "aerospike"
+        options:
+          hosts:
+            - "aerospike:3000"
+          namespace: "temporal"
+          setPrefix: ""
+          # Inside the compose network the node's advertised (container) address
+          # is reachable, so the normal service address is correct here.  Host
+          # side callers -- the conformance suites -- flip this to true and get
+          # `alternate-access-address` from deploy/aerospike.conf instead.
+          useServicesAlternate: false
+
+    es-visibility:
+      elasticsearch:
+        version: "v7"
+        logLevel: "error"
+        url:
+          scheme: "http"
+          host: "elasticsearch:9200"
+        indices:
+          visibility: temporal_visibility_v1_dev
+        closeIdleConnectionsInterval: 15s
+
+global:
+  membership:
+    maxJoinDuration: 30s
+  pprof:
+    port: 7936
+
+services:
+  frontend:
+    rpc:
+      grpcPort: 7233
+      membershipPort: 6933
+      httpPort: 7243
+      bindOnLocalHost: false
+
+  matching:
+    rpc:
+      grpcPort: 7235
+      membershipPort: 6935
+      bindOnLocalHost: false
+
+  history:
+    rpc:
+      grpcPort: 7234
+      membershipPort: 6934
+      bindOnLocalHost: false
+
+  worker:
+    rpc:
+      grpcPort: 7239
+      membershipPort: 6939
+      bindOnLocalHost: false
+
+clusterMetadata:
+  enableGlobalNamespace: false
+  failoverVersionIncrement: 10
+  masterClusterName: "active"
+  currentClusterName: "active"
+  clusterInformation:
+    active:
+      enabled: true
+      initialFailoverVersion: 1
+      rpcName: "frontend"
+      rpcAddress: "temporal:7233"
+
+dcRedirectionPolicy:
+  policy: "noop"

@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "skills": {
+    "aerospike": {
+      "source": "aerospike/agent-skills",
+      "ref": "main",
+      "sourceType": "github",
+      "skillPath": "compiled-skills/aerospike/SKILL.md",
+      "computedHash": "cd4b349019de5ca3d9cca22599f992a9ef6ab2f2456744334d796f7559742728"
+    },
+    "temporal-ops": {
+      "source": "temporalio/skill-temporal-ops",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "ec86a8959408ae19d80e36ac67f8f8b04a1d72961ad7988a59fed9679cf3cccc"
+    }
+  }
+}
