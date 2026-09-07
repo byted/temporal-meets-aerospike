@@ -1,0 +1,98 @@
+// Package conformance runs Temporal's own persistence test suites against the
+// Aerospike store.
+//
+// This is the project's primary feedback loop. The suites are Temporal's, not
+// ours: passing them is the definition of a correct store, and they encode
+// semantics that no amount of reading the interface would reveal.
+//
+// They are importable because common/persistence/tests is a normal package and
+// persistencetests.NewTestBaseForCluster is exported -- so no fork of Temporal
+// is needed. Temporal's *functional* suite (tests/) is package-private and is
+// deferred to Iteration 2.
+//
+// Requires a running node:
+//
+//	docker compose -f deploy/docker-compose.yml up -d aerospike roster-init
+package conformance
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/suite"
+	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/persistence/serialization"
+	persistencetests "go.temporal.io/server/common/persistence/persistence-tests"
+	"go.temporal.io/server/common/persistence/tests"
+
+	"github.com/stefanselent/temporal-meets-aerospike/store/aerospike"
+)
+
+// requireAerospike skips rather than fails when no node is reachable, so that
+// `go test ./...` on a machine without the compose stack up is not a wall of
+// red. A reachable-but-broken node still fails loudly.
+func requireAerospike(t *testing.T) {
+	t.Helper()
+	if err := aerospike.Ping(); err != nil {
+		t.Skipf("no Aerospike node reachable (%v)\n"+
+			"start one with: docker compose -f deploy/docker-compose.yml up -d aerospike roster-init", err)
+	}
+}
+
+func testLogger() log.Logger { return log.NewTestLogger() }
+
+// newTestBase wires Temporal's legacy TestBase to this store. The
+// AbstractDataStoreFactory field is the hook that makes
+// DataStoreFactoryProvider route to us.
+func newTestBase(t *testing.T) *persistencetests.TestBase {
+	t.Helper()
+	logger := testLogger()
+	cluster := aerospike.NewTestCluster(logger)
+
+	base := persistencetests.NewTestBaseForCluster(cluster, logger)
+	base.AbstractDataStoreFactory = aerospike.NewAbstractFactory()
+	return base
+}
+
+// --- Suites over raw stores (common/persistence/tests) ---
+
+func TestAerospikeShardStoreSuite(t *testing.T) {
+	requireAerospike(t)
+
+	factory, tearDown, err := aerospike.NewTestFactory(testLogger())
+	if err != nil {
+		t.Fatalf("creating Aerospike factory: %v", err)
+	}
+	defer tearDown()
+
+	shardStore, err := factory.NewShardStore()
+	if err != nil {
+		t.Fatalf("creating shard store: %v", err)
+	}
+
+	suite.Run(t, tests.NewShardSuite(
+		t,
+		shardStore,
+		serialization.NewSerializer(),
+		testLogger(),
+	))
+}
+
+// --- Suites over a TestBase (common/persistence/persistence-tests) ---
+
+func TestAerospikeMetadataPersistenceV2(t *testing.T) {
+	requireAerospike(t)
+
+	s := new(persistencetests.MetadataPersistenceSuiteV2)
+	s.TestBase = newTestBase(t)
+	s.TestBase.Setup(nil)
+	suite.Run(t, s)
+}
+
+func TestAerospikeClusterMetadataPersistence(t *testing.T) {
+	requireAerospike(t)
+
+	s := new(persistencetests.ClusterMetadataManagerSuite)
+	s.TestBase = newTestBase(t)
+	s.TestBase.Setup(nil)
+	suite.Run(t, s)
+}

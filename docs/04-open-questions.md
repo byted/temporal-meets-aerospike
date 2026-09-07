@@ -81,6 +81,43 @@ with (a); if assertions on the returned fields are flaky, switch to (b).
 
 ## Resolved
 
+### R9 — Aerospike does not store the user key by default
+
+*Resolved 2026-09-07, Phase 1.*
+
+`Key.Value()` returns nil on a record read back from a scan unless the write set `sendKey`. The
+first `DeleteNamespaceByName` implementation recovered a namespace id that way and silently got an
+empty string, orphaning the id record -- caught by `TestDeleteNamespace`, which then saw
+`Unavailable` instead of `NamespaceNotFound`.
+
+Rule for the rest of the store: **never recover identity from a record's key.** Carry any field
+you need to read back in a bin. Enabling `sendKey` would also work but costs storage on every
+record for the benefit of a handful of administrative paths.
+
+### R8 — Value conditions need filter expressions, not generation CAS
+
+*Resolved 2026-09-07, Phase 1.* See [03-data-model.md](03-data-model.md#conditional-writes-filter-expressions-not-generation-cas).
+
+Generation CAS would produce spurious `ShardOwnershipLostError` because generation moves on every
+write, while Temporal re-calls `UpdateShard` with an unchanged `rangeID`.
+`WritePolicy.FilterExpression` + `FILTERED_OUT` expresses the actual condition.
+
+### R7 — Cluster membership does not need Aerospike TTLs
+
+*Resolved 2026-09-07, Phase 1.*
+
+Membership records are the only part of the operational store with an expiry. Since the namespace
+runs `nsup-period 0`, a positive record TTL would be rejected outright -- and enabling NSUP would
+drag in interactions with durable deletes and transactions that the docs advise against.
+
+Instead each record stores its own expiry timestamp, reads filter on it, and
+`PruneClusterMembership` deletes what has lapsed. Temporal calls prune on a timer, and its own
+suite (`TestClusterMembershipUpsertExpiresCorrectly`) drives prune explicitly and allows five
+seconds -- so nothing depends on server-side expiry. All seven membership tests pass.
+
+This is the same shape as the answer to [Q1](#q1--per-task-ttl-has-no-direct-equivalent), which
+increases confidence in that plan.
+
 ### R1 — Can the store live outside the Temporal tree? — **Yes**
 
 *Resolved 2026-09-07, Phase 0.*

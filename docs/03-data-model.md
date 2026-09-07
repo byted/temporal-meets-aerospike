@@ -142,13 +142,51 @@ Two rules fall out of this:
   as sparse maps; the store never sees the full collection. They apply as `MapPutItemsOp` /
   `MapRemoveByKeyOp` within a single `Operate`.
 
+## Conditional writes: filter expressions, not generation CAS
+
+Temporal's protocol is full of *value* conditions -- `IF range_id = ?`,
+`IF db_record_version = ?`, `IF current_run_id = ?`. The obvious Aerospike analogue is generation
+CAS (`EXPECT_GEN_EQUAL`), and it is the wrong tool.
+
+Generation increments on **every** write to a record. Temporal calls `UpdateShard` repeatedly with
+an unchanged `rangeID` -- to persist queue ack levels, for instance -- so a caller holding a
+`rangeID` it correctly believes current would still be rejected after any unrelated update. That
+is a false `ShardOwnershipLostError`, which would make the history service drop and reacquire
+shards for no reason.
+
+The right primitive is `WritePolicy.FilterExpression`: a server-side predicate over the record's
+bins, evaluated before the write applies. A rejected write returns `FILTERED_OUT` (code 27).
+
+```mermaid
+flowchart TB
+    subgraph W["What Temporal asks for"]
+        w1["UPDATE shard SET ... IF range_id = 7"]
+    end
+    subgraph G["Generation CAS — wrong"]
+        g1["EXPECT_GEN_EQUAL(gen)"]
+        g2["fails after <i>any</i> unrelated write<br/>→ spurious ShardOwnershipLost"]
+        g1 --> g2
+    end
+    subgraph F["Filter expression — correct"]
+        f1["ExpEq(ExpIntBin(range_id), ExpIntVal(7))"]
+        f2["fails only if range_id actually moved<br/>→ FILTERED_OUT"]
+        f1 --> f2
+    end
+    W --> G
+    W --> F
+```
+
+Generation CAS still has a place -- for genuine read-modify-write where the whole record is the
+unit of concurrency -- but every condition in this store that mirrors a Cassandra `IF col = value`
+uses a filter expression.
+
 ## Error mapping
 
 | Aerospike condition | Temporal error |
 |---|---|
 | `CREATE_ONLY` write on existing shard record | `ShardAlreadyExistError` |
-| `range_id` mismatch, or MRT abort on the shard record | `ShardOwnershipLostError` |
-| `ver` (db record version) mismatch | `WorkflowConditionFailedError{NextEventID, DBRecordVersion}` |
+| `FILTERED_OUT` on the `range_id` condition, or MRT abort on the shard record | `ShardOwnershipLostError` |
+| `FILTERED_OUT` on the `ver` (db record version) condition | `WorkflowConditionFailedError{NextEventID, DBRecordVersion}` |
 | `curr` run-id / state mismatch | `CurrentWorkflowConditionFailedError` (7 fields) |
 | task-queue `range_id` mismatch | `ConditionFailedError` |
 | `KEY_BUSY` (14), `MRT_BLOCKED` (120) | retryable — surface as `Unavailable` |

@@ -73,7 +73,7 @@ The store is a **standalone Go module**. Temporal supports out-of-tree datastore
 ### Iteration 1 phases
 
 - [x] **Phase 0** — scaffolding, docker-compose stack, research notes
-- [ ] **Phase 1** — factory skeleton; shard, metadata, cluster-metadata stores
+- [x] **Phase 1** — factory skeleton; shard, metadata, cluster-metadata stores
 - [ ] **Phase 2** — execution store: mutable state and current execution
 - [ ] **Phase 3** — history tasks on bucketed k-ordered maps
 - [ ] **Phase 4** — history event store
