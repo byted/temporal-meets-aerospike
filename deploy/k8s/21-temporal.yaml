@@ -1,0 +1,123 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: temporal
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+spec:
+  selector:
+    app.kubernetes.io/name: temporal
+  ports:
+    - name: grpc
+      port: 7233
+      targetPort: grpc
+    - name: http
+      port: 7243
+      targetPort: http
+  # Membership ports are not published. All four services run in this one pod
+  # and ringpop gossips over the pod IP; nothing outside needs to reach them.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: temporal
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+  annotations:
+    # The control plane patches spec.template.spec.containers[0].env for
+    # TEMPORAL_ENVIRONMENT. Re-applying this file resets it to sqlite.
+    tma.dev/backend-switch: "patch TEMPORAL_ENVIRONMENT; do not edit the ConfigMap"
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate. Two servers must not overlap:
+  #   - on sqlite the database lives on the pod's own emptyDir, so a second pod
+  #     is a second, empty cluster that briefly answers requests
+  #   - on either backend, the switch is the thing being demonstrated, and a
+  #     rollout where both backends are live at once has no honest answer to
+  #     "which store is this workflow in?"
+  # The cost is a few seconds of downtime per switch, which is the point.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: temporal
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: temporal
+        app.kubernetes.io/part-of: temporal-meets-aerospike
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        # Makes the emptyDir group-owned by the image's `temporal` user, so the
+        # sqlite plugin can create its database and WAL files there.
+        fsGroup: 10001
+      containers:
+        - name: temporal
+          image: temporal-meets-aerospike/server:dev
+          # Never Always: this image is built on the box and imported straight
+          # into containerd (`k3s ctr images import`). There is no registry to
+          # pull it from, and Always turns the whole demo into ErrImagePull.
+          imagePullPolicy: IfNotPresent
+          # No command/args: the Dockerfile's ENTRYPOINT + CMD already run
+          # `start --config-dir /etc/temporal/config --allow-no-auth`.
+          env:
+            # The switch. The binary passes this to Temporal's config loader as
+            # `--env`, which loads <value>.yaml from the config dir. Valid
+            # values are the two keys in the temporal-config ConfigMap:
+            # "sqlite" and "aerospike".
+            #
+            # Defaults to sqlite so a fresh box comes up green without waiting
+            # on the Aerospike roster -- switching to aerospike is the demo.
+            - name: TEMPORAL_ENVIRONMENT
+              value: "sqlite"
+          ports:
+            - { name: grpc, containerPort: 7233 }
+            - { name: http, containerPort: 7243 }
+            - { name: pprof, containerPort: 7936 }
+          # Only proves the frontend is listening -- it does not prove the
+          # store behind it works. It cannot: a Temporal frontend accepts
+          # connections before the history service has claimed its shards. The
+          # control plane's own status check (an actual RPC) is the real gate.
+          startupProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+          volumeMounts:
+            - { name: config, mountPath: /etc/temporal/config, readOnly: true }
+            - { name: data, mountPath: /etc/temporal/data }
+      volumes:
+        - name: config
+          configMap:
+            name: temporal-config
+        # emptyDir, not a PVC: on the sqlite side each restart should start from
+        # a clean schema, and `setup: "true"` provisions it on connect. It also
+        # keeps the two backends honestly asymmetric -- Aerospike is the one
+        # with durable state here.
+        - name: data
+          emptyDir: {}

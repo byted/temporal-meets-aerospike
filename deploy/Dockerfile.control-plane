@@ -1,0 +1,34 @@
+# The demo control plane: a small HTTP service that flips Temporal's
+# persistence backend by patching the `temporal` Deployment's
+# TEMPORAL_ENVIRONMENT env var.  It talks to the Kubernetes API with a
+# ServiceAccount token, which is the whole reason the demo runs on k3s rather
+# than Docker -- the Docker equivalent would have been bind-mounting the Docker
+# socket, i.e. handing the web app root on the host.
+#
+# Same two-stage shape as deploy/Dockerfile so both images build from the same
+# module cache layer.
+
+FROM golang:1.26-alpine AS build
+
+WORKDIR /src
+
+# Dependency layer first, so source edits do not re-download the module graph.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/control-plane ./cmd/control-plane
+
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates tzdata && \
+    adduser -D -u 10001 control
+
+COPY --from=build /out/control-plane /usr/local/bin/control-plane
+
+USER control
+WORKDIR /home/control
+
+EXPOSE 8080
+
+ENTRYPOINT ["control-plane"]

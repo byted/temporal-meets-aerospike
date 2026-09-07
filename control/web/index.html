@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Temporal on Aerospike — Control Plane</title>
+  <!-- inline so the page never issues a request the control service does not serve -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23c2102c'/%3E%3Cpath d='M9 9l14 14M23 9L9 23' stroke='white' stroke-width='3.5' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">T×A</span>
+    <div class="brand-text">
+      <h1>Temporal&nbsp;on&nbsp;Aerospike</h1>
+      <p>Demo control plane</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span class="pill" id="pill-ns">namespace <code>—</code></span>
+    <span class="pill" id="pill-stream" data-tone="idle"><span class="dot"></span><span class="pill-text">events: connecting</span></span>
+  </div>
+</header>
+
+<ol class="stepper" id="stepper" aria-label="Demo steps">
+  <li data-step="1"><span class="step-n">1</span><span class="step-t">Running on SQLite</span></li>
+  <li data-step="2"><span class="step-n">2</span><span class="step-t">Run a workflow</span></li>
+  <li data-step="3"><span class="step-n">3</span><span class="step-t">Switch to Aerospike</span></li>
+  <li data-step="4"><span class="step-n">4</span><span class="step-t">Run it again</span></li>
+  <li data-step="5"><span class="step-n">5</span><span class="step-t">Inspect the data</span></li>
+</ol>
+
+<main>
+
+  <!-- ── The thing the demo is about ─────────────────────────────────── -->
+  <section class="hero" id="hero" data-backend="unknown">
+    <h2 class="hero-title">Operational persistence store</h2>
+
+    <div class="backend-track">
+      <div class="backend-tile" id="tile-sqlite">
+        <span class="tile-name">SQLite</span>
+        <span class="tile-note">Temporal's built-in dev store</span>
+        <span class="tile-badge">active</span>
+      </div>
+      <div class="track-arrow" id="track-arrow" aria-hidden="true">
+        <span class="arrow-glyph">→</span>
+      </div>
+      <div class="backend-tile" id="tile-aerospike">
+        <span class="tile-name">Aerospike</span>
+        <span class="tile-note">Custom out-of-tree store</span>
+        <span class="tile-badge">active</span>
+      </div>
+    </div>
+
+    <div class="hero-status">
+      <span class="pill big" id="pill-ready" data-tone="idle"><span class="dot"></span><span class="pill-text">Temporal: checking…</span></span>
+      <span class="pill big" id="pill-server" data-tone="idle"><span class="dot"></span><span class="pill-text">control plane: connecting</span></span>
+    </div>
+  </section>
+
+  <!-- ── Actions ─────────────────────────────────────────────────────── -->
+  <div class="grid-2">
+
+    <section class="panel" id="panel-workflow">
+      <header class="panel-head">
+        <h2>Workflow</h2>
+        <p>One workflow, one activity. The same code, whichever store is underneath.</p>
+      </header>
+      <div class="panel-body">
+        <div class="action-row">
+          <button class="btn primary" id="btn-run" type="button">
+            <span class="btn-label">Run workflow</span>
+            <span class="spinner" aria-hidden="true"></span>
+          </button>
+          <p class="action-hint" id="hint-run"></p>
+        </div>
+
+        <div class="runs">
+          <table class="runs-table" id="runs-table">
+            <thead>
+              <tr>
+                <th class="c-store">Store</th>
+                <th class="c-id">Workflow&nbsp;ID</th>
+                <th class="c-dur">Duration</th>
+                <th class="c-res">Result</th>
+              </tr>
+            </thead>
+            <tbody id="runs-body"></tbody>
+          </table>
+          <p class="empty" id="runs-empty">No runs yet. Press <strong>Run workflow</strong>.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-switch">
+      <header class="panel-head">
+        <h2>Infrastructure</h2>
+        <p>Reconfigure the stack to persist on Aerospike. Temporal restarts underneath.</p>
+      </header>
+      <div class="panel-body">
+        <div class="action-row">
+          <button class="btn danger" id="btn-switch" type="button">
+            <span class="btn-label">Switch to Aerospike</span>
+            <span class="spinner" aria-hidden="true"></span>
+          </button>
+          <p class="action-hint" id="hint-switch"></p>
+        </div>
+
+        <div class="log-wrap">
+          <div class="log-head">
+            <span>Progress</span>
+            <button class="btn tiny ghost" id="btn-clear-log" type="button">clear</button>
+          </div>
+          <ol class="log" id="log" aria-live="polite"></ol>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- ── Aerospike ───────────────────────────────────────────────────── -->
+  <section class="panel wide" id="panel-aerospike">
+    <header class="panel-head">
+      <h2>Aerospike namespace</h2>
+      <p>What Temporal's data actually looks like once it lands in Aerospike.</p>
+    </header>
+
+    <div class="panel-body">
+
+      <div class="health" id="health">
+        <div class="stat" id="stat-reach">
+          <span class="stat-label">Cluster</span>
+          <span class="stat-value">—</span>
+        </div>
+        <div class="stat" id="stat-sc">
+          <span class="stat-label">Strong consistency</span>
+          <span class="stat-value">—</span>
+        </div>
+        <div class="stat" id="stat-dead">
+          <span class="stat-label">Dead partitions</span>
+          <span class="stat-value">—</span>
+        </div>
+        <div class="stat" id="stat-unavail">
+          <span class="stat-label">Unavailable partitions</span>
+          <span class="stat-value">—</span>
+        </div>
+        <div class="stat" id="stat-objects">
+          <span class="stat-label">Objects</span>
+          <span class="stat-value">—</span>
+        </div>
+      </div>
+
+      <p class="notice" id="as-notice" hidden></p>
+
+      <h3 class="sub">Sets <span class="sub-note">— each one is a piece of Temporal's model</span></h3>
+      <div class="sets" id="sets"></div>
+      <p class="empty" id="sets-empty" hidden>No sets yet. Aerospike creates them on first write.</p>
+
+      <div class="records" id="records" hidden>
+        <div class="records-head">
+          <h3 class="sub">Records in <code id="records-set">—</code></h3>
+          <div class="records-actions">
+            <span class="records-count" id="records-count"></span>
+            <button class="btn tiny ghost" id="btn-close-records" type="button">close</button>
+          </div>
+        </div>
+        <p class="records-desc" id="records-desc"></p>
+        <div id="records-list"></div>
+      </div>
+
+    </div>
+  </section>
+
+  <footer class="foot">
+    <span id="foot-mode"></span>
+    <span>Visibility is unchanged by the switch — only the operational store is replaced.</span>
+  </footer>
+
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

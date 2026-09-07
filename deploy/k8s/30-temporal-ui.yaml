@@ -1,0 +1,75 @@
+# The Temporal Web UI is a separate binary (temporalio/ui-server). Only
+# `temporal server start-dev` bundles it into one process, and that path cannot
+# take a custom persistence factory -- so it is its own Deployment, exactly as
+# it is its own service in deploy/docker-compose.yml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal-ui
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: temporal-ui
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+spec:
+  selector:
+    app.kubernetes.io/name: temporal-ui
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-ui
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: temporal-ui
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: temporal-ui
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: temporal-ui
+        app.kubernetes.io/part-of: temporal-meets-aerospike
+    spec:
+      containers:
+        - name: ui
+          image: temporalio/ui:2.53.3
+          env:
+            - name: TEMPORAL_ADDRESS
+              value: "temporal:7233"
+            # The Ingress routes /temporal here without stripping the prefix,
+            # so the UI has to know it is not at the root. Without this the SPA
+            # is served fine and then asks for /_app/... at the root, gets the
+            # control plane's 404, and renders a blank page.
+            - name: TEMPORAL_UI_PUBLIC_PATH
+              value: "/temporal"
+            # The browser talks to ui-server, and ui-server proxies to the
+            # frontend, so CORS does not come up for normal use. Set it if you
+            # point a codec server or an external client at this UI.
+            # - name: TEMPORAL_CORS_ORIGINS
+            #   value: "http://demo.example.com"
+          ports:
+            - { name: http, containerPort: 8080 }
+          # tcpSocket rather than httpGet: with a public path set, / is a 404
+          # and the served path is an implementation detail of ui-server. A
+          # probe that asserts the URL layout would fail closed on a UI upgrade
+          # for no safety benefit -- this pod has no state to be wrong about.
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

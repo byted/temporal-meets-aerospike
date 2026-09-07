@@ -32,6 +32,11 @@ persistence:
           # side callers -- the conformance suites -- flip this to true and get
           # `alternate-access-address` from deploy/aerospike.conf instead.
           useServicesAlternate: false
+          # Stores the user key with each record so the demo's record browser can
+          # show `4:namespace:workflow:run` instead of a digest. Off by default in
+          # the store (see R9 in docs/04): it costs space on every record and
+          # nothing in the store ever reads it back.
+          sendKey: true
 
     es-visibility:
       elasticsearch:

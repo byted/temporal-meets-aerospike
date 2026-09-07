@@ -1,0 +1,81 @@
+# Traefik ships with k3s and is already the default IngressClass, so this needs
+# no controller install.
+#
+# No `host:` rule. The demo box is reached by IP or by whatever DNS name someone
+# points at it that day, and a host rule would silently 404 the moment that
+# changed. Add one when you add TLS -- cert-manager needs it anyway.
+#
+# Path routing, not prefix stripping: /temporal reaches ui-server *with* the
+# prefix intact, and ui-server is told about it via TEMPORAL_UI_PUBLIC_PATH.
+# Traefik orders ingress rules by matcher specificity, so /temporal wins over /.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo
+  namespace: tma
+  labels:
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          - path: /temporal
+            pathType: Prefix
+            backend:
+              service:
+                name: temporal-ui
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: control-plane
+                port:
+                  name: http
+
+# --- TLS ---------------------------------------------------------------------
+#
+# Left off because a fresh VM reached by IP cannot pass an ACME HTTP-01
+# challenge, and a half-working cert is worse than none.
+#
+# To enable, once the box has a DNS name that resolves to it publicly:
+#
+#   1. Install cert-manager:
+#        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.yaml
+#
+#   2. Create a ClusterIssuer (HTTP-01 through the same Traefik):
+#        apiVersion: cert-manager.io/v1
+#        kind: ClusterIssuer
+#        metadata:
+#          name: letsencrypt
+#        spec:
+#          acme:
+#            server: https://acme-v02.api.letsencrypt.org/directory
+#            email: you@example.com
+#            privateKeySecretRef:
+#              name: letsencrypt-account-key
+#            solvers:
+#              - http01:
+#                  ingress:
+#                    ingressClassName: traefik
+#
+#   3. Add to the Ingress above -- the annotation, a host on the rule, and the
+#      tls block. cert-manager watches for exactly this combination and fills
+#      in the Secret itself:
+#
+#        metadata:
+#          annotations:
+#            cert-manager.io/cluster-issuer: letsencrypt
+#            traefik.ingress.kubernetes.io/router.entrypoints: websecure
+#        spec:
+#          tls:
+#            - hosts: [demo.example.com]
+#              secretName: demo-tls
+#          rules:
+#            - host: demo.example.com     # required: the rule can no longer be hostless
+#              http: ...
+#
+# The control plane holds credentials in a basic-auth header. Until TLS is on,
+# those cross the network in the clear -- treat the demo box as untrusted.

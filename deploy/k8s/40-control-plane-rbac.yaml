@@ -1,0 +1,87 @@
+# The security boundary of the whole demo.
+#
+# The control plane is a web service, exposed on the internet-facing Ingress,
+# that restarts a workload. On Docker the only way to do that would have been
+# bind-mounting /var/run/docker.sock -- which is root on the host, for anyone
+# who gets past the basic auth. Choosing k3s was choosing this file instead:
+# the same capability, expressed as three verbs on two resource types in one
+# namespace, and revocable without redeploying anything.
+#
+# Deliberately absent: create, delete, exec, log, secrets, anything cluster
+# scoped. The control plane cannot make a pod, cannot read a Secret (its own
+# credentials arrive as env vars from the kubelet, not through the API), and
+# cannot see outside namespace `tma`.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: control-plane
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: control-plane
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+rules:
+  # Read the current backend and switch it. `patch` on exactly one Deployment
+  # by name -- resourceNames works for get and patch because both address a
+  # single object.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["temporal"]
+    verbs: ["get", "patch"]
+  # Show what is actually running: pod phase, restart count, which backend the
+  # live pod was started with.
+  #
+  # No resourceNames here, and it is not an oversight: `list` is a collection
+  # verb, and RBAC cannot restrict a collection request by name. Asking for
+  # list means asking for every pod in the namespace. Reads only.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: control-plane
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: control-plane
+subjects:
+  - kind: ServiceAccount
+    name: control-plane
+    namespace: tma
+---
+# Placeholder credentials. Replace before exposing the box to anything:
+#
+#   kubectl -n tma create secret generic control-plane-auth \
+#     --from-literal=username=admin \
+#     --from-literal=password="$(openssl rand -base64 24)" \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl -n tma rollout restart deployment/control-plane
+#
+# stringData rather than data so the value is reviewable in git. Base64 is not
+# encryption and pretending otherwise in a repo is worse than a plain string.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: control-plane-auth
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+type: Opaque
+stringData:
+  username: admin
+  password: change-me

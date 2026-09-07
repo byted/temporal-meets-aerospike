@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+spec:
+  selector:
+    app.kubernetes.io/name: control-plane
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: control-plane
+        app.kubernetes.io/part-of: temporal-meets-aerospike
+    spec:
+      serviceAccountName: control-plane
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: control-plane
+          image: temporal-meets-aerospike/control-plane:dev
+          # See the note in 21-temporal.yaml: built on the box, imported into
+          # containerd, no registry behind it.
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TEMPORAL_ADDRESS
+              value: "temporal:7233"
+            - name: AEROSPIKE_HOST
+              value: "aerospike:3000"
+            - name: AEROSPIKE_NAMESPACE
+              value: "temporal"
+            # The Kubernetes namespace the control plane operates in -- the one
+            # its Role is scoped to. Taken from the downward API rather than
+            # hardcoded so the RBAC scope and the code's idea of scope cannot
+            # drift apart.
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # The one Deployment it is allowed to patch. Must match
+            # resourceNames in 40-control-plane-rbac.yaml, or every switch
+            # fails with a 403 that reads like a bug in the control plane.
+            - name: TEMPORAL_DEPLOYMENT_NAME
+              value: "temporal"
+            # A *Temporal* namespace, not a Kubernetes one -- where the demo
+            # workflows are registered and listed.
+            - name: DEMO_NAMESPACE
+              value: "demo"
+            - name: BASIC_AUTH_USER
+              valueFrom:
+                secretKeyRef:
+                  name: control-plane-auth
+                  key: username
+            - name: BASIC_AUTH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: control-plane-auth
+                  key: password
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

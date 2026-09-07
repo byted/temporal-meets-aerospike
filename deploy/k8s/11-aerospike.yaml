@@ -1,0 +1,172 @@
+# Headless on purpose.
+#
+# Aerospike clients tend the cluster from a seed and then connect to each node
+# at the address that node advertises -- there is no proxy in the data path. A
+# ClusterIP Service would hand the client a virtual IP as the seed, which then
+# hands back the pod IP anyway; the extra hop buys nothing and makes the first
+# connection harder to reason about. clusterIP: None makes DNS resolve straight
+# to the pod IP, and it is also what a StatefulSet's serviceName wants.
+#
+# Endpoints still respect readiness, so the readiness probe below is a real gate
+# on whether the name resolves at all.
+apiVersion: v1
+kind: Service
+metadata:
+  name: aerospike
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: aerospike
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: aerospike
+  ports:
+    - name: client
+      port: 3000
+      targetPort: client
+    - name: fabric
+      port: 3001
+      targetPort: fabric
+    - name: heartbeat
+      port: 3002
+      targetPort: heartbeat
+    - name: info
+      port: 3003
+      targetPort: info
+---
+# A StatefulSet rather than a Deployment for the stable pod identity and the
+# volumeClaimTemplate. The node-id is pinned in the ConfigMap, so the identity
+# that actually matters to Aerospike is stable regardless -- but a Deployment
+# with a shared PVC would happily start a second pod against the same data file
+# during a rollout, which for a single-node SC namespace is not survivable.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aerospike
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: aerospike
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+spec:
+  serviceName: aerospike
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aerospike
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aerospike
+        app.kubernetes.io/part-of: temporal-meets-aerospike
+    spec:
+      # asd takes a while to flush and close its storage file cleanly. A SIGKILL
+      # partway through is recoverable, but only via the revive path.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: aerospike
+          # No platform pin anywhere in these manifests: the demo box is amd64,
+          # development happens on an arm64 Mac, and every image used here is
+          # multi-arch. Let the node pick.
+          image: aerospike/aerospike-server-enterprise:8.1.2.4
+          args: ["--config-file", "/etc/aerospike/conf/aerospike.conf"]
+          ports:
+            - { name: client, containerPort: 3000 }
+            - { name: fabric, containerPort: 3001 }
+            - { name: heartbeat, containerPort: 3002 }
+            - { name: info, containerPort: 3003 }
+          # Proves the client port is accepting. Deliberately not asinfo: this
+          # one runs forever, and an asinfo restart loop against a busy node is
+          # a worse failure than a hung TCP accept.
+          livenessProbe:
+            tcpSocket:
+              port: client
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          # The port being open says nothing about whether the SC namespace can
+          # serve. Until the roster sidecar has staged the roster and the
+          # recluster has landed, every read and write is rejected -- so gate
+          # the Service on the namespace's own view of itself instead. Without
+          # this, temporal starts, fails its first shard read, and crashloops
+          # until Aerospike happens to be ready.
+          #
+          # Three conditions, and the third is not redundant: a freshly created
+          # SC namespace with `roster=null` reports
+          # unavailable_partitions=0 and dead_partitions=0 while serving
+          # nothing at all. ns_cluster_size is 0 until the roster is staged and
+          # the recluster lands, and that is the condition that actually
+          # distinguishes "ready" from "brand new and useless".
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                # One asinfo call, greps over the captured output. See the note
+                # in roster-init.sh about `grep -q` and SIGPIPE.
+                - |
+                  s=$(asinfo -v "namespace/temporal" | tr ';' '\n') || exit 1
+                  echo "$s" | grep -x 'ns_cluster_size=1' > /dev/null &&
+                  echo "$s" | grep -x 'unavailable_partitions=0' > /dev/null &&
+                  echo "$s" | grep -x 'dead_partitions=0' > /dev/null
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            # No memory limit on purpose. The namespace uses the in-memory
+            # storage engine and grows towards `filesize` (2G) as data lands; a
+            # limit below that turns a full namespace into an OOMKill, which
+            # looks like a crash rather than a capacity problem. Bound it with
+            # `filesize` in the ConfigMap instead.
+            limits:
+              cpu: "2"
+          volumeMounts:
+            - { name: config, mountPath: /etc/aerospike/conf, readOnly: true }
+            - { name: data, mountPath: /opt/aerospike/data }
+
+        # Same pod, not a Job: the roster has to be re-staged after every
+        # restart, and it must run against 127.0.0.1 because the Service has no
+        # endpoints until the readiness probe above passes -- which is the very
+        # thing this container makes possible.
+        - name: roster-init
+          image: aerospike/aerospike-tools:13.0.3
+          command: ["/bin/bash", "/opt/roster/roster-init.sh"]
+          env:
+            - name: AEROSPIKE_NAMESPACE
+              value: temporal
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - { name: config, mountPath: /opt/roster, readOnly: true }
+      volumes:
+        - name: config
+          configMap:
+            name: aerospike
+            # Both keys land in both mounts; each container reads only the one
+            # it cares about. Splitting them into two ConfigMaps would mean two
+            # things to keep in sync for no gain.
+            items:
+              - { key: aerospike.conf, path: aerospike.conf }
+              - { key: roster-init.sh, path: roster-init.sh }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # No storageClassName: k3s's built-in local-path provisioner is the
+        # default StorageClass, which is what a single-node box wants.
+        resources:
+          requests:
+            # Comfortably above the namespace's `filesize 2G` -- the storage
+            # file is preallocated at full size.
+            storage: 4Gi

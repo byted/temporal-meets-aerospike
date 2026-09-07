@@ -120,6 +120,7 @@ $ go test ./e2e/ -v
 | [03 — Data model](docs/03-data-model.md) | The mapping, diagram-first. The living document |
 | [04 — Open questions](docs/04-open-questions.md) | What is still unknown, and the experiment that settles each |
 | [05 — Iterations 2 and 3](docs/05-iteration-2-3-sketch.md) | Direction for later work |
+| [06 — Demo control plane](docs/06-demo-control-plane.md) | The hosted, clickable demo: switch stores live and browse the data |
 
 ## Running it
 

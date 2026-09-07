@@ -79,6 +79,10 @@ func (c *client) buildPolicies() {
 		// Session consistency is the SC default: monotonic reads and
 		// read-your-writes, which is what most of the store needs.
 		bp.ReadModeSC = as.ReadModeSCSession
+		// Note: SendKey stays false on reads even when cfg.SendKey is set. On a
+		// read it does not fetch the stored key -- it asks the server to
+		// re-derive the digest and verify it, which is pure overhead here.
+		// Storing the key is a write-side concern; see newWrite below.
 		return bp
 	}
 
@@ -98,6 +102,20 @@ func (c *client) buildPolicies() {
 		// conditional or part of a transaction, and replaying one is a
 		// correctness bug rather than a latency win.
 		wp.MaxRetries = 0
+		// Off by default. Aerospike stores only the digest unless the write
+		// asks for the key, and R9 (docs/04-open-questions.md) made "never
+		// recover identity from a record's key" a rule of this store -- so
+		// nothing here reads it back, and paying for it on every record would
+		// buy nothing. The demo's record browser is the exception: a scan can
+		// only show digests, which are meaningless to a viewer, so the option
+		// makes records self-identifying for that one purpose.
+		//
+		// Set here rather than on each policy so that it reaches every write
+		// path: the four base policies below, and everything derived from them
+		// by casWrite, condWrite, condWriteTxn and txnPolicies, all of which
+		// copy one of these structs. Anything less would store the key on some
+		// records and not others, which is worse than not storing it at all.
+		wp.SendKey = c.cfg.SendKey
 		return wp
 	}
 

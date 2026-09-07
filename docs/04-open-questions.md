@@ -81,6 +81,53 @@ with (a); if assertions on the returned fields are flaky, switch to (b).
 
 ## Resolved
 
+### R20 — A frozen API contract needs an owner for its extensions
+
+*Resolved 2026-09-07, demo.*
+
+Four agents built the demo in parallel against a contract fixed up front. Two of them extended it
+sensibly and independently, and the extensions did not meet:
+
+- The Go service added an `error` field to `/api/state`, so a missing RBAC rule reports itself
+  rather than silently returning a fallback backend. The UI, built against the frozen contract,
+  never read it — so a misconfigured cluster would have confidently displayed the *wrong* live
+  store. Fixed by surfacing it in the UI.
+- The UI's footer claimed "visibility stays on Elasticsearch". True of the Compose stack, false of
+  the demo, which drops Elasticsearch entirely. Its brief never said so.
+
+Both are the same failure: parallelism is safe on **files**, but a shared contract still needs a
+single owner reconciling it afterwards. Splitting on file boundaries is necessary, not sufficient.
+
+### R19 — Pinning `node-id` does not prevent dead partitions
+
+*Resolved 2026-09-07, demo.*
+
+R16 concluded that a strong-consistency namespace marks all 4096 partitions dead because a
+recreated container gets a new node id, and that pinning `service { node-id }` fixes it. That is
+half right, and the half that is wrong matters more in Kubernetes.
+
+Measured: with the node id pinned, recreating the container on a surviving volume kept the id at
+`a1` — and staging the roster still produced 4096 dead partitions. Strong consistency refuses to
+serve data it cannot prove complete after an **unclean** stop, which in Kubernetes is any SIGKILL,
+node reboot, or OOM kill. Pinning is still worth doing; the revive path is load-bearing, not a
+fallback.
+
+Related: the roster is *cluster* state, not namespace data, so a restarted node always comes back
+with `roster=null`. The roster logic must therefore run on every start — which is why it is a
+sidecar rather than a one-shot Job.
+
+### R18 — `dead_partitions=0` is not a readiness signal
+
+*Resolved 2026-09-07, demo.*
+
+The obvious readiness probe for an SC namespace — `unavailable_partitions=0` and
+`dead_partitions=0` — does not gate anything. A freshly created namespace with `roster=null`
+reports **both as zero** while serving nothing. Measured directly.
+
+The probe must also require `ns_cluster_size=1`, which stays 0 until the recluster lands. Without
+it, the Service admits traffic to a namespace that rejects every operation, and the failure
+presents as a Temporal problem rather than an Aerospike one.
+
 ### R17 — `temporaltest` cannot host a custom datastore
 
 *Resolved 2026-09-07, Phase 5.*

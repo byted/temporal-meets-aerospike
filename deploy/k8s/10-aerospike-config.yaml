@@ -1,0 +1,232 @@
+# Aerospike server config plus the roster bootstrap script, adapted from
+# deploy/aerospike.conf and the `roster-init` service in
+# deploy/docker-compose.yml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aerospike
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: aerospike
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+data:
+  aerospike.conf: |
+    # Single node, strong-consistency (SC) namespace. SC is required because
+    # multi-record transactions (MRT) only work in SC namespaces, and Temporal's
+    # persistence contract needs both:
+    #   - MRT, to reproduce Cassandra's single-partition conditional batches
+    #   - quorum-consistent reads, or history tasks can be silently lost
+    #
+    # SC and MRT are Enterprise-only features. The EE container image ships a
+    # perpetual single-node evaluation feature key (server 6.1+) that includes
+    # `asdb-strong-consistency`, so no key needs to be mounted here.
+
+    service {
+        cluster-name temporal-poc
+
+        # The single most important line in this file.
+        #
+        # A node id is derived from the MAC address by default, so it changes
+        # every time the pod is recreated -- and in Kubernetes pods are recreated
+        # constantly: node drain, image change, `kubectl rollout restart`, an
+        # eviction. The PVC survives all of those. When the surviving roster
+        # names a node id that no longer exists, an SC namespace marks all 4096
+        # partitions *dead* and refuses every read and write. The failure
+        # surfaces as `Node not found for partition temporal:4092`, which does
+        # not obviously point at the roster. See docs/04-open-questions.md R16.
+        #
+        # Pinning the id makes the restarted pod the same node as far as the
+        # roster is concerned, so the namespace comes back on its own. The
+        # roster sidecar still repairs the case where it does not.
+        #
+        # Any 1-16 digit hex value except 0. Single node, so any constant works.
+        node-id a1
+    }
+
+    logging {
+        console {
+            context any info
+        }
+    }
+
+    network {
+        service {
+            address any
+            port 3000
+
+            # Aerospike clients talk directly to every node; there is no proxy
+            # in the data path. The client tends the cluster and then connects
+            # to whatever address a node advertises.
+            #
+            # Unset `access-address` means the node advertises its pod IP, which
+            # is what an in-cluster client (the temporal pod) must use. The
+            # `aerospike` Service is headless precisely so the seed address the
+            # client tends from is already the pod IP rather than a virtual one.
+            #
+            # A client reached through `kubectl port-forward` cannot route to a
+            # pod IP, so it sets ClientPolicy.UseServicesAlternate and gets this
+            # address instead. That is how the conformance suites run against
+            # the in-cluster node.
+            alternate-access-address 127.0.0.1
+        }
+
+        heartbeat {
+            mode mesh
+            port 3002
+            interval 150
+            timeout 10
+        }
+
+        fabric {
+            port 3001
+        }
+
+        info {
+            port 3003
+        }
+    }
+
+    namespace temporal {
+        # A single-node SC cluster must have replication-factor equal to the
+        # cluster size. SC requires at least as many nodes as the replication
+        # factor, so RF1 is the only valid setting here.
+        replication-factor 1
+        strong-consistency true
+
+        # Nothing in the operational store expires on a wall clock: Temporal
+        # deletes explicitly. Leaving NSUP off avoids the TTL/durable-delete
+        # interactions that transactions are documented not to mix with.
+        default-ttl 0
+        nsup-period 0
+
+        # The 7.1+ default is 1 MiB. Mutable state is one record holding
+        # execution info plus six collection bins, and every update rewrites the
+        # whole record, so we raise this to the 8 MiB hard ceiling and rely on
+        # Temporal's own TransactionSizeLimit to stay under it.
+        max-record-size 8M
+
+        storage-engine memory {
+            file /opt/aerospike/data/temporal.dat
+            filesize 2G
+        }
+        # 2G, not the 4G that deploy/docker-compose.yml uses: the demo box is a
+        # ~4 GB VM that also runs k3s, Temporal, the UI and the control plane.
+        # The file is preallocated at this size on the PVC, so keep the PVC in
+        # 11-aerospike.yaml comfortably larger.
+    }
+
+  roster-init.sh: |
+    #!/usr/bin/env bash
+    #
+    # Stage the roster for the strong-consistency namespace, then stay alive.
+    #
+    # An SC namespace serves *nothing* until a roster has been staged and the
+    # cluster reclustered. In compose this was a one-shot service the server
+    # waited on; a Pod has no equivalent of `service_completed_successfully`,
+    # so it is a sidecar that runs the same steps and then sleeps.
+    #
+    # It has to run on every start, not just the first: the roster is cluster
+    # state, not namespace data. A restarted node comes back with
+    # `roster=null` however clean its shutdown was, and the storage file on the
+    # PVC does not change that.
+    #
+    # Everything here uses asinfo rather than asadm. asadm's `manage` commands
+    # prompt for confirmation whenever the namespace looks damaged, and with no
+    # TTY they die with EOFError -- which is exactly the situation this script
+    # exists to repair.
+    set -euo pipefail
+
+    ns="${AEROSPIKE_NAMESPACE:-temporal}"
+
+    # 127.0.0.1, deliberately not the `aerospike` Service. The server
+    # container's readiness probe requires dead_partitions=0, so the Service has
+    # no endpoints until this script has done its job. Going through the Service
+    # would deadlock.
+    host=127.0.0.1
+
+    echo "waiting for asd on ${host}:3000..."
+    # /dev/tcp is a bash builtin; this image has bash.
+    for _ in $(seq 1 180); do
+      if (echo > "/dev/tcp/${host}/3000") 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+    if ! (echo > "/dev/tcp/${host}/3000") 2>/dev/null; then
+      echo "ERROR: asd never opened port 3000" >&2
+      exit 1
+    fi
+
+    echo "staging roster for namespace '${ns}'..."
+    # NB: the roster info command separates fields with ':', while
+    # namespace/<ns> uses ';'. They are not consistent.
+    observed=$(asinfo -h "$host" -v "roster:namespace=${ns}" \
+                 | tr ':' '\n' | grep '^observed_nodes=' | cut -d= -f2)
+    if [ -z "$observed" ]; then
+      echo "ERROR: no observed nodes for namespace '${ns}'" >&2
+      exit 1
+    fi
+    asinfo -h "$host" -v "roster-set:namespace=${ns};nodes=${observed}"
+    asinfo -h "$host" -v "recluster:"
+
+    # This fires routinely, not just in the R16 case. Measured on the real
+    # image: kill the container without a clean shutdown, start it again on the
+    # same volume, stage the roster -- all 4096 partitions come back *dead*
+    # even though the node id is unchanged, because SC will not serve data it
+    # cannot prove is complete. In Kubernetes that is any SIGKILL after the
+    # grace period, any node reboot, any OOM kill.
+    #
+    # Pinning node-id in aerospike.conf prevents a different and worse failure
+    # (the roster naming a node that no longer exists); it does not make this
+    # branch dead code.
+    #
+    # Safe here and only here: one node, no replicas, so there is no diverged
+    # copy to choose between. On a real cluster revive can resurrect stale data
+    # and is not something to automate.
+    dead=$(asinfo -h "$host" -v "namespace/${ns}" \
+             | tr ';' '\n' | grep '^dead_partitions=' | cut -d= -f2)
+    if [ "${dead:-0}" != "0" ]; then
+      echo "namespace '${ns}' has ${dead} dead partitions (node identity changed); reviving"
+      asinfo -h "$host" -v "revive:namespace=${ns}"
+      asinfo -h "$host" -v "recluster:"
+    fi
+
+    # recluster is asynchronous. Do not report success until the namespace can
+    # actually serve, or the server starts against a namespace that rejects
+    # every read and write.
+    #
+    # NB: `grep -x ... > /dev/null`, never `grep -qx`. Under pipefail, `grep -q`
+    # exits on its first match, `tr` then dies of SIGPIPE (141), and the
+    # pipeline reports failure even though the match succeeded.
+    #
+    # ns_cluster_size is the load-bearing check. A rosterless SC namespace
+    # reports unavailable_partitions=0 and dead_partitions=0 while rejecting
+    # every operation -- the partition counters alone would let this loop
+    # succeed on the first iteration whether or not the recluster landed.
+    ready=0
+    for _ in $(seq 1 60); do
+      state=$(asinfo -h "$host" -v "namespace/${ns}" | tr ';' '\n')
+      if echo "$state" | grep -x 'ns_cluster_size=1' > /dev/null &&
+         echo "$state" | grep -x 'unavailable_partitions=0' > /dev/null &&
+         echo "$state" | grep -x 'dead_partitions=0' > /dev/null; then
+        echo "namespace '${ns}': all 4096 partitions available"
+        asinfo -h "$host" -v "roster:namespace=${ns}"
+        ready=1
+        break
+      fi
+      sleep 1
+    done
+
+    if [ "$ready" != "1" ]; then
+      echo "ERROR: namespace '${ns}' is still not fully available" >&2
+      asinfo -h "$host" -v "namespace/${ns}" \
+        | tr ';' '\n' | grep -E 'unavailable|dead|ns_cluster_size|strong-consistency' >&2
+      # Exit non-zero so the container restarts and tries again rather than
+      # sitting there looking healthy next to a namespace that serves nothing.
+      exit 1
+    fi
+
+    # The pod must stay up, so this cannot exit 0 the way the compose one-shot
+    # did. `exec` so sleep becomes the container's main process and dies on
+    # SIGTERM instead of waiting out the grace period.
+    exec sleep infinity

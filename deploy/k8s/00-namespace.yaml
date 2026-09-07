@@ -1,0 +1,13 @@
+# Everything lives in one namespace so the control plane's RBAC Role can be
+# namespace-scoped.  A ClusterRole would have been one line shorter and would
+# have given a web-facing service cluster-wide reach.
+#
+# Named `tma` rather than `demo` on purpose: the control plane also has a
+# DEMO_NAMESPACE setting, and that one is a *Temporal* namespace.  Two things
+# called "demo" in the same demo is how outages start.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tma
+  labels:
+    app.kubernetes.io/part-of: temporal-meets-aerospike

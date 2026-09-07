@@ -35,6 +35,23 @@ type Config struct {
 	// comment in deploy/aerospike.conf.
 	UseServicesAlternate bool
 
+	// SendKey stores the user key alongside the digest on every record this
+	// store writes. Off by default, and deliberately so: Aerospike keeps only
+	// the 20-byte digest unless asked otherwise, so enabling this adds the
+	// full key -- e.g. "4:namespace-id:workflow-id:run-id" -- to every record,
+	// on every write, forever.
+	//
+	// Nothing in the store reads the key back. That is the rule established by
+	// R9 in docs/04-open-questions.md ("never recover identity from a record's
+	// key"; carry anything you need in a bin), and it still holds with this
+	// option on. Turning it on must never become a correctness dependency --
+	// the store has to behave identically either way.
+	//
+	// It exists purely as a demo affordance: the record browser scans sets and
+	// can only render digests otherwise, which tells a viewer nothing about
+	// the data model. With the key stored, a record identifies itself.
+	SendKey bool
+
 	User     string
 	Password string
 
@@ -87,6 +104,9 @@ func NewConfig(cfg config.CustomDatastoreConfig) (*Config, error) {
 		return nil, err
 	}
 	if c.UseServicesAlternate, err = o.boolean("useServicesAlternate", false); err != nil {
+		return nil, err
+	}
+	if c.SendKey, err = o.boolean("sendKey", false); err != nil {
 		return nil, err
 	}
 	if c.User, err = o.str("user", ""); err != nil {

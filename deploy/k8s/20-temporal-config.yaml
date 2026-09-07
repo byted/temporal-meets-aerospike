@@ -1,0 +1,234 @@
+# Both backend configurations, in one ConfigMap, mounted together.
+#
+# The server binary picks between them with the `--env` flag, which reads
+# TEMPORAL_ENVIRONMENT (cmd/temporal-aerospike-server/main.go), and Temporal's
+# loader turns that into `<env>.yaml` in the config dir. So switching backends
+# is a change to one env var on the Deployment -- Kubernetes notices the pod
+# template changed and restarts the pod itself.
+#
+# The alternative was rewriting a single temporal.yaml in place. That does not
+# work: a ConfigMap update propagates into a running pod asynchronously (up to a
+# kubelet sync period), does not restart anything, and leaves the old and new
+# config briefly disagreeing. An env var change is a pod template change, which
+# is a rollout, which is atomic and observable.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: temporal-config
+  namespace: tma
+  labels:
+    app.kubernetes.io/name: temporal
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+data:
+  # TEMPORAL_ENVIRONMENT=sqlite
+  sqlite.yaml: |
+    # Stock Temporal: SQLite for both the operational store and visibility.
+    # This is the control case in the demo -- the side the audience already
+    # believes works.
+    log:
+      stdout: true
+      level: info
+
+    persistence:
+      defaultStore: sqlite-default
+      visibilityStore: sqlite-visibility
+
+      # Must match aerospike.yaml. numHistoryShards is immutable for a given
+      # store, and the two configs are two views of the same cluster identity.
+      numHistoryShards: 4
+
+      datastores:
+        sqlite-default:
+          sql:
+            pluginName: "sqlite"
+            # File mode, on an emptyDir. Not `mode: memory`, because Temporal
+            # opens the operational and visibility stores as separate
+            # connections and an in-memory database is per-connection.
+            databaseName: "/etc/temporal/data/temporal.db"
+            # SQLite ignores both of these, but common/config tags them
+            # `validate:"nonzero"` and the server refuses to load a config
+            # without them.
+            connectAddr: "localhost"
+            connectProtocol: "tcp"
+            connectAttributes:
+              # The whole reason there is no schema-tool step: in file mode the
+              # sqlite plugin runs its own DDL on connect when setup is "true",
+              # and treats "table already exists" as benign.
+              #
+              # Quoted, all of them: connectAttributes is map[string]string, and
+              # an unquoted `true` or `2` fails to unmarshal.
+              setup: "true"
+              journal_mode: "wal"
+              synchronous: "2"
+            maxConns: 1
+            maxIdleConns: 1
+            maxConnLifetime: "1h"
+
+        sqlite-visibility:
+          sql:
+            pluginName: "sqlite"
+            databaseName: "/etc/temporal/data/visibility.db"
+            connectAddr: "localhost"
+            connectProtocol: "tcp"
+            connectAttributes:
+              setup: "true"
+              journal_mode: "wal"
+              synchronous: "2"
+            maxConns: 1
+            maxIdleConns: 1
+            maxConnLifetime: "1h"
+
+    global:
+      membership:
+        maxJoinDuration: 30s
+      pprof:
+        port: 7936
+
+    services:
+      frontend:
+        rpc:
+          grpcPort: 7233
+          membershipPort: 6933
+          httpPort: 7243
+          bindOnLocalHost: false
+
+      matching:
+        rpc:
+          grpcPort: 7235
+          membershipPort: 6935
+          bindOnLocalHost: false
+
+      history:
+        rpc:
+          grpcPort: 7234
+          membershipPort: 6934
+          bindOnLocalHost: false
+
+      worker:
+        rpc:
+          grpcPort: 7239
+          membershipPort: 6939
+          bindOnLocalHost: false
+
+    clusterMetadata:
+      enableGlobalNamespace: false
+      failoverVersionIncrement: 10
+      masterClusterName: "active"
+      currentClusterName: "active"
+      clusterInformation:
+        active:
+          enabled: true
+          initialFailoverVersion: 1
+          rpcName: "frontend"
+          rpcAddress: "temporal:7233"
+
+    dcRedirectionPolicy:
+      policy: "noop"
+
+  # TEMPORAL_ENVIRONMENT=aerospike
+  aerospike.yaml: |
+    # Operational persistence on Aerospike; visibility stays on SQLite.
+    #
+    # The only unusual part is the `customDatastore` block: Temporal dispatches
+    # on the *presence* of that key (common/persistence/client/fx.go), not on
+    # its `name`, and hands the whole thing to whatever AbstractDataStoreFactory
+    # the binary registered via temporal.WithCustomDataStoreFactory(). Exactly
+    # one custom datastore factory can exist per process -- which is why
+    # visibility cannot also be Aerospike, and is SQLite here.
+    #
+    # No Elasticsearch: the compose stack uses it for visibility, but it is a
+    # second stateful service with a JVM heap on a 4 GB box, and the demo is
+    # about the operational store. Out of scope on purpose.
+    log:
+      stdout: true
+      level: info
+
+    persistence:
+      defaultStore: aerospike-default
+      visibilityStore: sqlite-visibility
+
+      # Must match sqlite.yaml.
+      numHistoryShards: 4
+
+      datastores:
+        aerospike-default:
+          customDatastore:
+            name: "aerospike"
+            options:
+              # The headless Service. DNS resolves to the pod IP, and the pod is
+              # only an endpoint once its readiness probe says the SC namespace
+              # can serve.
+              hosts:
+                - "aerospike:3000"
+              namespace: "temporal"
+              setPrefix: ""
+              # In-cluster the node's advertised (pod) address is routable, so
+              # the normal service address is correct. Callers reaching the node
+              # through `kubectl port-forward` flip this to true and get
+              # `alternate-access-address` instead.
+              useServicesAlternate: false
+              # Store the primary key alongside the record. Costs a little space
+              # per record; the metadata store needs it to recover a namespace
+              # id from a key rather than duplicating it into a bin.
+              sendKey: true
+
+        sqlite-visibility:
+          sql:
+            pluginName: "sqlite"
+            databaseName: "/etc/temporal/data/visibility.db"
+            connectAddr: "localhost"
+            connectProtocol: "tcp"
+            connectAttributes:
+              setup: "true"
+              journal_mode: "wal"
+              synchronous: "2"
+            maxConns: 1
+            maxIdleConns: 1
+            maxConnLifetime: "1h"
+
+    global:
+      membership:
+        maxJoinDuration: 30s
+      pprof:
+        port: 7936
+
+    services:
+      frontend:
+        rpc:
+          grpcPort: 7233
+          membershipPort: 6933
+          httpPort: 7243
+          bindOnLocalHost: false
+
+      matching:
+        rpc:
+          grpcPort: 7235
+          membershipPort: 6935
+          bindOnLocalHost: false
+
+      history:
+        rpc:
+          grpcPort: 7234
+          membershipPort: 6934
+          bindOnLocalHost: false
+
+      worker:
+        rpc:
+          grpcPort: 7239
+          membershipPort: 6939
+          bindOnLocalHost: false
+
+    clusterMetadata:
+      enableGlobalNamespace: false
+      failoverVersionIncrement: 10
+      masterClusterName: "active"
+      currentClusterName: "active"
+      clusterInformation:
+        active:
+          enabled: true
+          initialFailoverVersion: 1
+          rpcName: "frontend"
+          rpcAddress: "temporal:7233"
+
+    dcRedirectionPolicy:
+      policy: "noop"
