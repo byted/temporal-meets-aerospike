@@ -28,6 +28,8 @@ var allSets = []string{
 	setExecution,
 	setCurrent,
 	setHistoryTask,
+	setHistoryTaskIdx,
+	setReplicationDLQ,
 	setHistoryTree,
 	setHistoryBranch,
 	setHistoryNode,

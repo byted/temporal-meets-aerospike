@@ -31,35 +31,6 @@ func (s *executionStore) ListConcreteExecutions(context.Context, *p.ListConcrete
 	// pattern Aerospike has no good answer for. Out of scope for the PoC.
 	return nil, unimplemented("ListConcreteExecutions")
 }
-func (s *executionStore) AddHistoryTasks(context.Context, *p.InternalAddHistoryTasksRequest) error {
-	return unimplemented("AddHistoryTasks")
-}
-func (s *executionStore) GetHistoryTasks(context.Context, *p.GetHistoryTasksRequest) (*p.InternalGetHistoryTasksResponse, error) {
-	return nil, unimplemented("GetHistoryTasks")
-}
-func (s *executionStore) CompleteHistoryTask(context.Context, *p.CompleteHistoryTaskRequest) error {
-	return unimplemented("CompleteHistoryTask")
-}
-func (s *executionStore) RangeCompleteHistoryTasks(context.Context, *p.RangeCompleteHistoryTasksRequest) error {
-	return unimplemented("RangeCompleteHistoryTasks")
-}
-
-// Replication DLQ: single-cluster deployments never reach these.
-func (s *executionStore) PutReplicationTaskToDLQ(context.Context, *p.PutReplicationTaskToDLQRequest) error {
-	return unimplemented("PutReplicationTaskToDLQ")
-}
-func (s *executionStore) GetReplicationTasksFromDLQ(context.Context, *p.GetReplicationTasksFromDLQRequest) (*p.InternalGetReplicationTasksFromDLQResponse, error) {
-	return nil, unimplemented("GetReplicationTasksFromDLQ")
-}
-func (s *executionStore) DeleteReplicationTaskFromDLQ(context.Context, *p.DeleteReplicationTaskFromDLQRequest) error {
-	return unimplemented("DeleteReplicationTaskFromDLQ")
-}
-func (s *executionStore) RangeDeleteReplicationTaskFromDLQ(context.Context, *p.RangeDeleteReplicationTaskFromDLQRequest) error {
-	return unimplemented("RangeDeleteReplicationTaskFromDLQ")
-}
-func (s *executionStore) IsReplicationDLQEmpty(context.Context, *p.GetReplicationTasksFromDLQRequest) (bool, error) {
-	return true, nil
-}
 
 // --- TaskStore (Phase 5) ---
 

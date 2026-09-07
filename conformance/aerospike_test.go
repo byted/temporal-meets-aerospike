@@ -104,6 +104,33 @@ func TestAerospikeExecutionMutableStateStoreSuite(t *testing.T) {
 	))
 }
 
+func TestAerospikeExecutionMutableStateTaskStoreSuite(t *testing.T) {
+	requireAerospike(t)
+
+	factory, tearDown, err := aerospike.NewTestFactory(testLogger())
+	if err != nil {
+		t.Fatalf("creating Aerospike factory: %v", err)
+	}
+	defer tearDown()
+
+	shardStore, err := factory.NewShardStore()
+	if err != nil {
+		t.Fatalf("creating shard store: %v", err)
+	}
+	executionStore, err := factory.NewExecutionStore()
+	if err != nil {
+		t.Fatalf("creating execution store: %v", err)
+	}
+
+	suite.Run(t, tests.NewExecutionMutableStateTaskSuite(
+		t,
+		shardStore,
+		executionStore,
+		serialization.NewSerializer(),
+		testLogger(),
+	))
+}
+
 func TestAerospikeHistoryStoreSuite(t *testing.T) {
 	requireAerospike(t)
 

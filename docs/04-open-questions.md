@@ -81,6 +81,35 @@ with (a); if assertions on the returned fields are flaky, switch to (b).
 
 ## Resolved
 
+### R13 — Bucketed ranges need a bucket index
+
+*Resolved 2026-09-07, Phase 3.*
+
+The bucketing scheme in the plan was incomplete. Iterating buckets over a *numeric* span breaks the
+moment a caller asks for the whole key space, which Temporal does when draining a queue:
+`[0, MaxInt64)` is 2^51 buckets. It surfaced as a client timeout, not as an obvious logic error.
+
+Fixed with a per-(shard, category) index record listing populated buckets. See
+[03-data-model.md](03-data-model.md#a-bucket-index-is-mandatory-not-an-optimisation).
+
+Three further bugs from the same phase, all worth remembering:
+
+- **Page tokens must record the last key *emitted*, not the next one pending.** Recording the
+  pending key silently dropped exactly one task per page, since the resume filter skips everything
+  at or before the token.
+- **A `[]byte` cannot be a Go map key**, so grouping scheduled tasks by encoded key needs a slice
+  of operations rather than a map.
+- **When one `Operate` carries several operations against the same bin, the client returns their
+  results as a list**, not a scalar — so a trailing `MapSizeOp` reads back as `[]any`.
+
+### R14 — `IsReplicationDLQEmpty` ignores the max key
+
+*Resolved 2026-09-07, Phase 3.*
+
+Callers leave `ExclusiveMaxTaskKey` zero-valued, so honouring it makes the range `[0, 0)` and the
+answer always "empty". Cassandra's implementation ignores it too and asks only whether any task
+exists at or after the minimum.
+
 ### R12 — Phase order: mutable state and history events are coupled
 
 *Resolved 2026-09-07, Phase 2.*
