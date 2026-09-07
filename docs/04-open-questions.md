@@ -81,6 +81,53 @@ with (a); if assertions on the returned fields are flaky, switch to (b).
 
 ## Resolved
 
+### R17 — `temporaltest` cannot host a custom datastore
+
+*Resolved 2026-09-07, Phase 5.*
+
+The plan proposed running the e2e demo through
+`temporaltest.NewServer(WithBaseServerOptions(WithCustomDataStoreFactory(...)))`. That does not
+work: `temporaltest` documents that "storage and client configuration will always be overridden",
+and it forces SQLite regardless of the server options passed.
+
+The e2e therefore runs against the real compose stack via `cmd/temporal-aerospike-server`, which is
+a better test anyway — it exercises the same binary and configuration path an operator would use.
+
+### R16 — A strong-consistency namespace needs reviving after the container is recreated
+
+*Resolved 2026-09-07, Phase 5.*
+
+Recreating the Aerospike container while its data volume survives gives the node a **new node id**.
+The roster still names the old one, so the namespace marks all 4096 partitions **dead** and refuses
+every read and write. The server failed with `Node not found for partition temporal:4092`, which
+does not obviously point at the roster.
+
+`roster-init` now detects `dead_partitions > 0` and issues `revive` before reclustering. Safe here
+and only here: one node, no replicas, so there is no diverged copy to choose between. On a real
+cluster, revive can resurrect stale data and is not something to automate.
+
+Two related traps in the same script:
+
+- `asadm manage` commands **prompt for confirmation** whenever the namespace looks damaged, and
+  with no TTY they die with `EOFError` — exactly when the repair is needed. The whole script uses
+  `asinfo`, which never prompts.
+- The `roster:` info command separates fields with **`:`**, while `namespace/<ns>` uses **`;`**.
+  They are not consistent, and parsing one with the other's separator silently yields nothing.
+
+### R15 — Parallel subtests outlive `defer`
+
+*Resolved 2026-09-07, Phase 5.*
+
+`RunQueueV2TestSuite` uses parallel subtests, which run *after* the enclosing test function
+returns. A `defer tearDown()` closed the Aerospike client out from under them, and the failure
+surfaced as `Partition map empty` — which reads like a cluster problem rather than a test-lifecycle
+one. All conformance tests now use `t.Cleanup`.
+
+The same phase also forced a change to test isolation: a single shared set prefix does not work,
+because suites that assert on a global list (`ListQueues`) see each other's data. Each harness now
+gets a unique set prefix. The cost is that set names persist until the server restarts; Aerospike
+allows a few thousand per namespace, and `docker compose down -v` resets it.
+
 ### R13 — Bucketed ranges need a bucket index
 
 *Resolved 2026-09-07, Phase 3.*

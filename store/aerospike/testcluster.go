@@ -3,6 +3,7 @@ package aerospike
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"go.temporal.io/server/common/config"
@@ -34,8 +35,25 @@ type TestCluster struct {
 }
 
 // TestSetPrefix keeps conformance data separate from anything real that might
-// share the namespace.
-const TestSetPrefix = "test_"
+// share the namespace. Each harness appends a unique suffix.
+const TestSetPrefix = "t"
+
+// nextTestPrefix hands out a distinct set prefix per harness.
+//
+// Cassandra's harness creates a randomly-named keyspace per run and drops it.
+// Aerospike namespaces are declared in the *server* config and cannot be
+// created at runtime, so isolation has to come from set names instead.
+//
+// The cost: set names persist until the server restarts, so each test binary
+// leaves its sets behind as metadata. Aerospike allows a few thousand sets per
+// namespace, which is many runs' worth, and `docker compose down -v` resets it.
+// Sharing one fixed prefix was tried first and does not work -- suites that
+// assert on a global list (QueueV2's ListQueues) see each other's data.
+var nextTestPrefix atomic.Int64
+
+func newTestSetPrefix() string {
+	return fmt.Sprintf("%s%d_%d_", TestSetPrefix, os.Getpid()%100000, nextTestPrefix.Add(1))
+}
 
 // NewTestCluster builds a harness pointed at a local Aerospike node. Honours
 // AEROSPIKE_HOST / AEROSPIKE_PORT / AEROSPIKE_NAMESPACE so CI can retarget it.
@@ -48,7 +66,7 @@ func NewTestCluster(logger log.Logger) *TestCluster {
 		cfg: &Config{
 			Hosts:     []string{fmt.Sprintf("%s:%s", host, port)},
 			Namespace: namespace,
-			SetPrefix: TestSetPrefix,
+			SetPrefix: newTestSetPrefix(),
 			// Tests run on the host while the node runs in a container and
 			// advertises its container IP. deploy/aerospike.conf sets
 			// alternate-access-address for exactly this.

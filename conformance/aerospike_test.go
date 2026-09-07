@@ -16,6 +16,7 @@
 package conformance
 
 import (
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -30,6 +31,11 @@ import (
 // requireAerospike skips rather than fails when no node is reachable, so that
 // `go test ./...` on a machine without the compose stack up is not a wall of
 // red. A reachable-but-broken node still fails loudly.
+// NOTE on teardown: these tests use t.Cleanup rather than defer. Some suites
+// (QueueV2) run parallel subtests, which execute *after* the enclosing test
+// function returns -- a deferred teardown closes the Aerospike client out from
+// under them, and the failure surfaces as "Partition map empty", which looks
+// like a cluster problem rather than a test-lifecycle one.
 func requireAerospike(t *testing.T) {
 	t.Helper()
 	if err := aerospike.Ping(); err != nil {
@@ -62,7 +68,7 @@ func TestAerospikeShardStoreSuite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating Aerospike factory: %v", err)
 	}
-	defer tearDown()
+	t.Cleanup(tearDown)
 
 	shardStore, err := factory.NewShardStore()
 	if err != nil {
@@ -84,7 +90,7 @@ func TestAerospikeExecutionMutableStateStoreSuite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating Aerospike factory: %v", err)
 	}
-	defer tearDown()
+	t.Cleanup(tearDown)
 
 	shardStore, err := factory.NewShardStore()
 	if err != nil {
@@ -111,7 +117,7 @@ func TestAerospikeExecutionMutableStateTaskStoreSuite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating Aerospike factory: %v", err)
 	}
-	defer tearDown()
+	t.Cleanup(tearDown)
 
 	shardStore, err := factory.NewShardStore()
 	if err != nil {
@@ -138,7 +144,7 @@ func TestAerospikeHistoryStoreSuite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating Aerospike factory: %v", err)
 	}
-	defer tearDown()
+	t.Cleanup(tearDown)
 
 	executionStore, err := factory.NewExecutionStore()
 	if err != nil {
@@ -146,6 +152,102 @@ func TestAerospikeHistoryStoreSuite(t *testing.T) {
 	}
 
 	suite.Run(t, tests.NewHistoryEventsSuite(t, executionStore, testLogger()))
+}
+
+func TestAerospikeTaskQueueSuite(t *testing.T) {
+	requireAerospike(t)
+
+	factory, tearDown, err := aerospike.NewTestFactory(testLogger())
+	if err != nil {
+		t.Fatalf("creating Aerospike factory: %v", err)
+	}
+	t.Cleanup(tearDown)
+
+	taskStore, err := factory.NewTaskStore()
+	if err != nil {
+		t.Fatalf("creating task store: %v", err)
+	}
+	suite.Run(t, tests.NewTaskQueueSuite(t, taskStore, testLogger()))
+}
+
+func TestAerospikeTaskQueueTaskSuite(t *testing.T) {
+	requireAerospike(t)
+
+	factory, tearDown, err := aerospike.NewTestFactory(testLogger())
+	if err != nil {
+		t.Fatalf("creating Aerospike factory: %v", err)
+	}
+	t.Cleanup(tearDown)
+
+	taskStore, err := factory.NewTaskStore()
+	if err != nil {
+		t.Fatalf("creating task store: %v", err)
+	}
+	suite.Run(t, tests.NewTaskQueueTaskSuite(t, taskStore, testLogger()))
+}
+
+func TestAerospikeTaskQueueFairTaskSuite(t *testing.T) {
+	requireAerospike(t)
+
+	factory, tearDown, err := aerospike.NewTestFactory(testLogger())
+	if err != nil {
+		t.Fatalf("creating Aerospike factory: %v", err)
+	}
+	t.Cleanup(tearDown)
+
+	fairStore, err := factory.NewFairTaskStore()
+	if err != nil {
+		t.Fatalf("creating fair task store: %v", err)
+	}
+	suite.Run(t, tests.NewTaskQueueFairTaskSuite(t, fairStore, testLogger()))
+}
+
+func TestAerospikeTaskQueueUserDataSuite(t *testing.T) {
+	requireAerospike(t)
+
+	factory, tearDown, err := aerospike.NewTestFactory(testLogger())
+	if err != nil {
+		t.Fatalf("creating Aerospike factory: %v", err)
+	}
+	t.Cleanup(tearDown)
+
+	taskStore, err := factory.NewTaskStore()
+	if err != nil {
+		t.Fatalf("creating task store: %v", err)
+	}
+	suite.Run(t, tests.NewTaskQueueUserDataSuite(t, taskStore, testLogger()))
+}
+
+func TestAerospikeQueueV2(t *testing.T) {
+	requireAerospike(t)
+
+	factory, tearDown, err := aerospike.NewTestFactory(testLogger())
+	if err != nil {
+		t.Fatalf("creating Aerospike factory: %v", err)
+	}
+	t.Cleanup(tearDown)
+
+	queue, err := factory.NewQueueV2()
+	if err != nil {
+		t.Fatalf("creating queue: %v", err)
+	}
+	tests.RunQueueV2TestSuite(t, queue)
+}
+
+func TestAerospikeNexusEndpoints(t *testing.T) {
+	requireAerospike(t)
+
+	factory, tearDown, err := aerospike.NewTestFactory(testLogger())
+	if err != nil {
+		t.Fatalf("creating Aerospike factory: %v", err)
+	}
+	t.Cleanup(tearDown)
+
+	store, err := factory.NewNexusEndpointStore()
+	if err != nil {
+		t.Fatalf("creating nexus endpoint store: %v", err)
+	}
+	tests.RunNexusEndpointTestSuite(t, store, new(atomic.Int64))
 }
 
 // --- Suites over a TestBase (common/persistence/persistence-tests) ---

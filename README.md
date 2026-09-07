@@ -66,7 +66,7 @@ The store is a **standalone Go module**. Temporal supports out-of-tree datastore
 
 | Iteration | Goal | State |
 |---|---|---|
-| 1 | Get it working — conformance suites green, workflow runs end to end | in progress |
+| 1 | Get it working — conformance suites green, workflow runs end to end | **complete** |
 | 2 | Temporal's functional suite + performance tests green | not started |
 | 3 | Optimization and tuning | not started |
 
@@ -77,7 +77,39 @@ The store is a **standalone Go module**. Temporal supports out-of-tree datastore
 - [x] **Phase 2** — execution store: mutable state and current execution
 - [x] **Phase 3** — history tasks on bucketed k-ordered maps
 - [x] **Phase 4** — history event store *(pulled forward: the mutable-state suite depends on it)*
-- [ ] **Phase 5** — task store, queues, nexus, end-to-end workflow demo
+- [x] **Phase 5** — task store, queues, nexus, end-to-end workflow demo
+
+## Results
+
+Temporal's own persistence conformance suites, run against a live Aerospike node:
+
+| Suite | Tests |
+|---|---|
+| `ShardSuite` | 4 |
+| `ExecutionMutableStateSuite` | 45 |
+| `ExecutionMutableStateTaskSuite` | 15 |
+| `HistoryEventsSuite` | 12 |
+| `TaskQueueSuite` / `TaskQueueTaskSuite` / `TaskQueueFairTaskSuite` / `TaskQueueUserDataSuite` | 18 |
+| `QueueV2` + `HistoryTaskQueueManager` | 33 |
+| `NexusEndpoint` | 9 |
+| `MetadataPersistenceSuiteV2` | 22 |
+| `HistoryV2PersistenceSuite` | 5 |
+| `ClusterMetadataManagerSuite` | 7 |
+| Aerospike capability checks (ours) | 6 |
+| **Total** | **175 passing, 0 failing** |
+
+And the thing that actually matters — a workflow with an activity, start to finish:
+
+```
+$ temporal operator cluster describe
+  ClusterName  PersistenceStore  VisibilityStore
+  active       aerospike         elasticsearch
+
+$ go test ./e2e/ -v
+    workflow started: id=85503329-3053-46ed-9bf2-bacbe4889498
+    workflow completed: Hello world, from Aerospike
+--- PASS: TestWorkflowWithActivity
+```
 
 ## Documentation
 

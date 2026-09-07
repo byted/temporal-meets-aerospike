@@ -62,28 +62,62 @@ services:
     command:
       - |
         set -euo pipefail
-        echo "staging roster for namespace 'temporal'..."
-        asadm -h aerospike -e "enable; manage roster stage observed ns temporal"
-        asadm -h aerospike -e "enable; manage recluster"
 
-        # recluster is asynchronous.  Do not report success until every
-        # partition is actually available, or the server will start against a
-        # namespace that rejects reads and writes.
-        # NB: `grep -x ... > /dev/null`, never `grep -qx`.  Under `pipefail`,
+        # Everything here uses asinfo rather than asadm.  asadm's `manage`
+        # commands prompt for confirmation whenever the namespace looks
+        # damaged, and with no TTY they die with EOFError -- which is exactly
+        # the situation this script exists to repair.
+
+        ns=temporal
+
+        echo "staging roster for namespace '$$ns'..."
+        # NB: the roster info command separates fields with ':', while
+        # namespace/<ns> uses ';'.  They are not consistent.
+        observed=$$(asinfo -h aerospike -v "roster:namespace=$$ns" \
+                     | tr ':' '\n' | grep '^observed_nodes=' | cut -d= -f2)
+        if [ -z "$$observed" ]; then
+          echo "ERROR: no observed nodes for namespace '$$ns'" >&2
+          exit 1
+        fi
+        asinfo -h aerospike -v "roster-set:namespace=$$ns;nodes=$$observed"
+        asinfo -h aerospike -v "recluster:"
+
+        # A strong-consistency namespace marks every partition dead when the
+        # roster names a node that no longer exists -- which is what happens
+        # each time compose recreates the container while its data volume
+        # survives.  Reviving tells the server to trust what is on disk.
+        #
+        # Safe here and only here: one node, no replicas, so there is no
+        # diverged copy to choose between.  On a real cluster revive can
+        # resurrect stale data and is not something to automate.
+        dead=$$(asinfo -h aerospike -v "namespace/$$ns" \
+                  | tr ';' '\n' | grep '^dead_partitions=' | cut -d= -f2)
+        if [ "$${dead:-0}" != "0" ]; then
+          echo "namespace '$$ns' has $$dead dead partitions (node identity changed); reviving"
+          asinfo -h aerospike -v "revive:namespace=$$ns"
+          asinfo -h aerospike -v "recluster:"
+        fi
+
+        # recluster is asynchronous.  Do not report success until the namespace
+        # can actually serve, or the server starts against a namespace that
+        # rejects every read and write.
+        #
+        # NB: `grep -x ... > /dev/null`, never `grep -qx`.  Under pipefail,
         # `grep -q` exits on its first match, `tr` then dies of SIGPIPE (141),
         # and the pipeline reports failure even though the match succeeded.
         for _ in $$(seq 1 30); do
-          if asinfo -h aerospike -v "namespace/temporal" \
-               | tr ';' '\n' | grep -x 'unavailable_partitions=0' > /dev/null; then
-            echo "namespace 'temporal': all 4096 partitions available"
-            asadm -h aerospike -e "enable; show roster"
+          state=$$(asinfo -h aerospike -v "namespace/$$ns" | tr ';' '\n')
+          if echo "$$state" | grep -x 'unavailable_partitions=0' > /dev/null &&
+             echo "$$state" | grep -x 'dead_partitions=0' > /dev/null; then
+            echo "namespace '$$ns': all 4096 partitions available"
+            asinfo -h aerospike -v "roster:namespace=$$ns"
             exit 0
           fi
           sleep 1
         done
 
-        echo "ERROR: namespace 'temporal' still has unavailable partitions" >&2
-        asinfo -h aerospike -v "namespace/temporal" \
+        echo "ERROR: namespace '$$ns' is still not fully available" >&2
+        asinfo -h aerospike -v "namespace/$$ns" \
           | tr ';' '\n' | grep -E 'unavailable|dead|strong-consistency' >&2
         exit 1
     networks: [tma]
