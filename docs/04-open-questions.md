@@ -81,6 +81,47 @@ with (a); if assertions on the returned fields are flaky, switch to (b).
 
 ## Resolved
 
+### R22 — The backend switch works, verified on a real cluster
+
+*Resolved 2026-09-07, demo.*
+
+The switch was the one path proven only against a fake Kubernetes clientset. Run on k3d (k3s
+v1.35.5) on an arm64 Mac, both directions, with data-level evidence:
+
+| Step | Result | Aerospike objects |
+|---|---|---|
+| Baseline on SQLite | workflow completes, 77 ms | 0 |
+| Switch → Aerospike | **8.6 s** | 0 → 78 (bootstrap) |
+| Workflow on Aerospike | completes, 37 ms | 78 → **96** |
+| Switch → SQLite | ~12 s | 96 (frozen) |
+| Workflow on SQLite | completes, 44 ms | 96 (frozen) |
+
+`temporal operator cluster describe` independently reported `PersistenceStore: aerospike`, then
+`sqlite` after switching back. The designed sequence appeared in the logs in order, including the
+namespace re-registration that a naive implementation omits.
+
+Notably, the Aerospike strong-consistency machinery — roster staging, revive, the readiness gate,
+the part expected to be painful — worked first time on every install. The two bugs found were
+elsewhere.
+
+Effort for a person on a fresh machine: **60–90 minutes**, dominated by two Go image builds; ~10
+minutes to repeat with images prebuilt.
+
+### R21 — Kubernetes Service links collide with application config
+
+*Resolved 2026-09-07, demo.*
+
+`temporal-ui` crash-looped with `cannot unmarshal !!str 'tcp://1...' into int`, a message naming
+neither Kubernetes nor the Service.
+
+Kubernetes injects Docker-link environment variables for every Service in the namespace. The
+`temporal-ui` Service therefore handed its own pod `TEMPORAL_UI_PORT=tcp://10.43.185.164:8080` —
+and `TEMPORAL_UI_PORT` is also ui-server's own key for its listen port. The platform silently
+overwrote application config through a namespace coincidence.
+
+Fixed with `enableServiceLinks: false` plus an explicit `TEMPORAL_UI_PORT`. Worth remembering for
+any app whose config keys look like `<SERVICE>_PORT`.
+
 ### R20 — A frozen API contract needs an owner for its extensions
 
 *Resolved 2026-09-07, demo.*

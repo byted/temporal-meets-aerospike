@@ -14,11 +14,28 @@ viable arrived in server 8.0.
 The EE container image ships a **perpetual single-node evaluation feature key** (server 6.1+) that
 includes `asdb-strong-consistency`, so the PoC needs no key file
 ([consistency setup](https://aerospike.com/docs/server/operations/configure/consistency)). That key
-is governed by the [Evaluation License](https://aerospike.com/legal/evaluation-license-agreement/):
-internal evaluation and development only, **not for production use**.
+is governed by Aerospike's evaluation terms.
 
-This bounds what the evaluation can conclude: an Aerospike-backed Temporal would only be usable by
-Enterprise customers.
+> **Correction (2026-09-07).** An earlier version of this file quoted the phrase *"not for any
+> production use"* and linked it to `aerospike.com/legal/evaluation-license-agreement/`. Both were
+> wrong. That URL now serves the **Master Subscription Agreement**, and the quoted phrase does not
+> appear in it — it comes from a separate download-trial agreement. The substance (evaluation and
+> development only) does hold, but via §1.2 of the actual Evaluation License Agreement, not the
+> sentence quoted here.
+
+Two consequences, and the second one is easy to miss:
+
+1. An Aerospike-backed Temporal would only be usable by Enterprise customers, so this bounds who
+   the result is for.
+2. **The evaluation terms restrict publishing comparative benchmarks.** The Evaluation License
+   Agreement §3.1(iv) prohibits "publishing or disclosing to any third party any benchmarking or
+   comparative study involving any Product", and the Master Subscription Agreement carries a
+   parallel restriction at §7.4(e). This repository *is* a comparative study, and Iteration 2 is
+   explicitly about producing performance numbers against a Cassandra baseline — so this constrains
+   what may be published, independently of where the demo is hosted.
+
+See [07-hosting-options.md](07-hosting-options.md) for the full licence analysis with verbatim
+clauses and current source URLs.
 
 ## Strong consistency
 

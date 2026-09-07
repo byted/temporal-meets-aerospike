@@ -38,11 +38,9 @@ func main() {
 	server := control.NewServer(cfg, logger)
 	defer server.Close()
 
-	// Best-effort: Temporal may still be coming up. The switch path retries
-	// both the namespace registration and the worker start.
-	startCtx, cancelStart := context.WithTimeout(context.Background(), 30*time.Second)
-	server.Start(startCtx)
-	cancelStart()
+	// Returns immediately and keeps retrying in the background: Temporal is
+	// usually still booting when this runs, since both are applied together.
+	server.Start(context.Background())
 
 	httpServer := &http.Server{
 		Addr:    net.JoinHostPort("", cfg.Port),

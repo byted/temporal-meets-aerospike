@@ -37,12 +37,33 @@ spec:
         app.kubernetes.io/name: temporal-ui
         app.kubernetes.io/part-of: temporal-meets-aerospike
     spec:
+      # Load-bearing. Kubernetes injects legacy Docker-link environment
+      # variables for every Service in the namespace, named
+      # <SERVICE>_PORT=tcp://<clusterIP>:<port>.  The Service in this very file
+      # is called `temporal-ui`, so the pod is handed
+      # TEMPORAL_UI_PORT=tcp://10.43.x.y:8080 -- and ui-server's own config key
+      # for the port it listens on is, exactly, TEMPORAL_UI_PORT.  The result is
+      # an immediate CrashLoopBackOff:
+      #
+      #   config file corrupted: yaml: unmarshal errors:
+      #     line 6: cannot unmarshal !!str `tcp://1...` into int
+      #
+      # which names neither Kubernetes nor the Service.  Turning the links off
+      # removes the whole collision class rather than the one instance of it;
+      # nothing in this pod ever used them (TEMPORAL_ADDRESS is set explicitly
+      # below, and DNS is how everything else is found).
+      enableServiceLinks: false
       containers:
         - name: ui
           image: temporalio/ui:2.53.3
           env:
             - name: TEMPORAL_ADDRESS
               value: "temporal:7233"
+            # Belt and braces: an explicit env var beats an injected service
+            # link, so this keeps the pod healthy even if enableServiceLinks
+            # above is ever removed.
+            - name: TEMPORAL_UI_PORT
+              value: "8080"
             # The Ingress routes /temporal here without stripping the prefix,
             # so the UI has to know it is not at the root. Without this the SPA
             # is served fine and then asks for /_app/... at the root, gets the

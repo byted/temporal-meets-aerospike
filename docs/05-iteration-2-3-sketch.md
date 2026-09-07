@@ -72,4 +72,11 @@ Not "does it work" — Iteration 1 answers that. The real questions are:
 3. Does the Enterprise-only licensing (see [02](02-aerospike-capabilities.md)) leave a viable
    audience for the result?
 
+**A constraint on question 2 that was not visible when this was written:** the evaluation terms
+prohibit publishing benchmarking or comparative studies (Evaluation License §3.1(iv), and Master
+Subscription Agreement §7.4(e)). Iteration 2 exists to produce exactly such numbers. Measuring
+privately to inform a decision is one thing; publishing a Cassandra-versus-Aerospike comparison is
+another, and that needs settling with Aerospike before the work is done rather than after. See
+[07-hosting-options.md](07-hosting-options.md).
+
 Question 3 needs no code and can be answered at any time.

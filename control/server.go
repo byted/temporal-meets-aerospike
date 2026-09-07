@@ -46,6 +46,10 @@ type Server struct {
 	// no help at all when you are trying to diagnose that rule.
 	backendErr error
 
+	// closed stops the background readiness retry when the server shuts down.
+	closed    chan struct{}
+	closeOnce sync.Once
+
 	mu        sync.Mutex
 	switching bool
 	// lastBackend is what /api/state reports when Kubernetes cannot be read.
@@ -60,6 +64,7 @@ func NewServer(cfg Config, logger *slog.Logger) *Server {
 		events:      newSSEHub(),
 		logger:      logger,
 		lastBackend: BackendSQLite,
+		closed:      make(chan struct{}),
 	}
 
 	backend, err := NewBackendController(cfg)
@@ -72,20 +77,79 @@ func NewServer(cfg Config, logger *slog.Logger) *Server {
 	return s
 }
 
-// Start brings the demo worker up so the run button works before anyone has
-// clicked switch. Failure is logged, not returned: Temporal may still be
-// starting, and StartWorker is retried on the next switch.
+// Start brings the demo worker up so the run button works before anyone clicks
+// switch.
+//
+// This retries in the background rather than attempting once, because attempting
+// once reliably loses. `kubectl apply -f` starts the control plane and Temporal
+// at the same moment, so the first EnsureNamespace hits a frontend that is not
+// listening yet. A single attempt then leaves the demo permanently reporting
+// temporalReady=false, and the run button returning "worker is not running; the
+// backend switch may still be in progress" -- an error that blames the switch
+// for a startup race. Observed on 2 of 2 cold installs, so it is the normal
+// path, not an edge case.
+//
+// Returns immediately; the caller's context bounds only the first attempt.
 func (s *Server) Start(ctx context.Context) {
-	if err := s.runner.EnsureNamespace(ctx); err != nil {
-		s.logger.Warn("could not register the demo namespace at startup", "error", err)
-		return
-	}
-	if err := s.runner.StartWorker(ctx); err != nil {
-		s.logger.Warn("could not start the demo worker at startup", "error", err)
+	go s.ensureReady()
+}
+
+// ensureReady keeps trying to register the namespace and start the worker until
+// it succeeds or the server closes. Backs off to avoid hammering a frontend
+// that is still booting, and reports the outcome so the UI shows why the run
+// button is not ready yet.
+func (s *Server) ensureReady() {
+	const (
+		firstDelay = 500 * time.Millisecond
+		maxDelay   = 5 * time.Second
+	)
+
+	delay := firstDelay
+	for attempt := 1; ; attempt++ {
+		select {
+		case <-s.closed:
+			return
+		default:
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err := s.runner.EnsureNamespace(ctx)
+		if err == nil {
+			err = s.runner.StartWorker(ctx)
+		}
+		cancel()
+
+		if err == nil {
+			if attempt > 1 {
+				s.logger.Info("demo worker ready", "attempts", attempt)
+				s.events.publish(Event{
+					Type:    EventProgress,
+					Message: "Demo worker is ready.",
+					Ts:      time.Now(),
+				})
+			}
+			return
+		}
+
+		// Only the first failure is worth a line in the log; after that it is
+		// just noise while Temporal boots.
+		if attempt == 1 {
+			s.logger.Warn("demo worker not ready yet, retrying in the background", "error", err)
+		}
+
+		select {
+		case <-s.closed:
+			return
+		case <-time.After(delay):
+		}
+		if delay < maxDelay {
+			delay *= 2
+		}
 	}
 }
 
 func (s *Server) Close() {
+	s.closeOnce.Do(func() { close(s.closed) })
 	s.runner.Close()
 	s.browser.Close()
 	s.events.close()

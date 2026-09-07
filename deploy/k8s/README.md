@@ -66,6 +66,45 @@ kubectl get nodes
 k3s brings its own Traefik ingress controller and a `local-path` default
 StorageClass. Nothing else needs installing.
 
+### 1b. …or k3d, to run the whole thing on a laptop
+
+k3d is k3s inside Docker, so it is the same distribution, the same Traefik and
+the same `local-path` provisioner as the box above — only the image-import verb
+differs. This is the route to use on a Mac, and it is the one the manifests
+were last verified against (macOS 15, arm64, Docker Desktop, k3d v5.9.0 /
+k3s v1.35.5).
+
+```sh
+brew install k3d                       # kubectl too, if you do not have it
+
+# -p maps the host port onto the cluster's Traefik. Without it the Ingress
+# exists but nothing on the host can reach it.
+k3d cluster create tma --agents 0 -p "8080:80@loadbalancer" --wait
+```
+
+Everything below is identical except step 2's import command, and the demo is
+then at `http://localhost:8080/` rather than at the box's IP.
+
+Give Docker Desktop ~6 GB. On the default 4 GB the cluster comes up, but a
+concurrent `docker build` can starve the API server long enough that
+`kubectl` reports `TLS handshake timeout` and the Traefik helm-install job
+fails its first attempt — both recover on their own, so build the images
+*before* creating the cluster if you would rather not watch that happen.
+
+Tear down with `k3d cluster delete tma`.
+
+**On an arm64 Mac, check `DOCKER_DEFAULT_PLATFORM` before building.** If it is
+set to `linux/amd64` — a common workaround to have lying around in a shell
+profile — both images build as amd64, import happily into an arm64 cluster and
+then crash with `exec format error`. For a k3d cluster on Apple Silicon you
+want arm64, so override it explicitly rather than trusting the default:
+
+```sh
+export DOCKER_DEFAULT_PLATFORM=linux/arm64      # or unset it
+docker build --platform linux/arm64 -f deploy/Dockerfile -t ... .
+docker image inspect temporal-meets-aerospike/server:dev --format '{{.Architecture}}'
+```
+
 ## 2. Build and import the two images
 
 Both images are built from source in this repo and are **never pushed to a
@@ -84,6 +123,17 @@ sudo docker save temporal-meets-aerospike/server:dev        | sudo k3s ctr image
 sudo docker save temporal-meets-aerospike/control-plane:dev | sudo k3s ctr images import -
 
 sudo k3s ctr images ls | grep temporal-meets-aerospike
+```
+
+On **k3d**, the node is a container and k3d does the save-and-import itself —
+one command replaces the three above:
+
+```sh
+k3d image import -c tma \
+  temporal-meets-aerospike/server:dev \
+  temporal-meets-aerospike/control-plane:dev
+
+docker exec k3d-tma-server-0 crictl images | grep temporal-meets-aerospike
 ```
 
 Building on an **arm64 Mac** for an amd64 box: an arm64 image imports happily
@@ -124,7 +174,40 @@ temporal-ui-5f7b8c9d4-pl9wq      1/1     Running   0          85s
 Aerospike takes 30–60 s to reach `2/2`: its readiness probe refuses until the
 strong-consistency namespace is in a staged roster (`ns_cluster_size=1`) with
 no unavailable or dead partitions, which cannot happen until the roster sidecar
-has run.
+has run. (Measured on k3d: 35 s.)
+
+**Then restart the control plane once.** All four pods report `Running` and the
+demo is still not usable until you do:
+
+```sh
+kubectl -n tma rollout restart deployment/control-plane
+kubectl -n tma rollout status  deployment/control-plane
+```
+
+`kubectl apply -f` starts the control plane and Temporal at the same instant, so
+the control plane's one attempt to register the `demo` Temporal namespace lands
+while Temporal is still binding its port. It logs
+
+```
+level=WARN msg="could not register the demo namespace at startup"
+  error="... dial tcp 10.43.x.y:7233: connect: connection refused"
+```
+
+and does not try again, which leaves `GET /api/state` reporting
+`"temporalReady": false` for good and the Run button returning
+`503 demo worker is not running`. The restart is the whole fix — by then
+Temporal is listening, the namespace registers, and the worker starts. This is
+a control-plane bug (`control/server.go:78-86`, `Start` returns on the first
+error instead of retrying), not a manifest one; until it is fixed the restart is
+a required install step. Clicking **Switch** also clears it, because the switch
+path re-runs the same register-and-start-worker sequence.
+
+Verify before going further:
+
+```sh
+curl -s -u admin:change-me http://localhost:8080/api/state
+# {"backend":"sqlite","temporalReady":true,"switching":false,"namespace":"demo"}
+```
 
 Set a real password before exposing the box to anything:
 
@@ -147,6 +230,9 @@ hostname -I | awk '{print $1}'     # on the box
 
 - `http://<ip>/` — control plane
 - `http://<ip>/temporal` — Temporal Web UI
+
+On **k3d**, that is the port you published on the load balancer:
+`http://localhost:8080/` and `http://localhost:8080/temporal`.
 
 TLS is off. [`50-ingress.yaml`](50-ingress.yaml) has a commented cert-manager
 block with the steps to turn it on once the box has a public DNS name.
@@ -258,6 +344,32 @@ silently yields nothing.
 `revive` is safe **only** on this single-node, RF1 setup: there is no diverged
 replica to choose between. Do not automate it on a real cluster.
 
+### `temporal-ui` CrashLoopBackOff: `cannot unmarshal !!str 'tcp://1...' into int`
+
+Fixed in [`30-temporal-ui.yaml`](30-temporal-ui.yaml); here because the error
+message points nowhere near the cause and the fix is easy to drop in a rewrite.
+
+Kubernetes injects legacy Docker-link environment variables for every Service in
+the namespace, as `<SERVICE>_PORT=tcp://<clusterIP>:<port>`. The Service is
+called `temporal-ui`, so the pod is handed
+`TEMPORAL_UI_PORT=tcp://10.43.x.y:8080` — and `TEMPORAL_UI_PORT` is also
+ui-server's own config key for the port it listens on. It reads the injected
+value, fails to parse `tcp://…` as an int, and exits before printing anything
+that mentions Kubernetes:
+
+```
+config file corrupted: yaml: unmarshal errors:
+  line 6: cannot unmarshal !!str `tcp://1...` into int
+```
+
+`enableServiceLinks: false` on the pod spec removes the collision class; the
+manifest also sets `TEMPORAL_UI_PORT: "8080"` explicitly, since an explicit env
+var beats an injected link. Confirm the injection with:
+
+```sh
+kubectl -n tma exec deployment/control-plane -- env | grep _PORT=
+```
+
 ### `ErrImageNeverPull` / `ImagePullBackOff` on temporal or control-plane
 
 The image was not imported into containerd, or was imported into dockerd only.
@@ -312,4 +424,5 @@ go test ./conformance/...
 
 ```sh
 kubectl delete namespace tma      # takes the PVC with it
+k3d cluster delete tma            # k3d: the whole cluster, images and all
 ```
