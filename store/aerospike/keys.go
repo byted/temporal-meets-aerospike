@@ -10,19 +10,27 @@ import (
 // the logical tables of the store. Set names are limited to 63 bytes, so the
 // names are short and the optional test prefix is kept short too.
 const (
-	setShard           = "shard"    // shard lease + serialized ShardInfo
-	setNamespace       = "ns"       // namespace record, keyed by namespace name
-	setNamespaceByID   = "nsid"     // namespace id -> name pointer
-	setNamespaceMeta   = "nsmeta"   // the single notification_version record
-	setClusterMeta     = "cmeta"    // per-cluster metadata + version
-	setClusterMember   = "cmember"  // cluster membership, expires via TTL
-	setSchema          = "schema"   // our schema version record
+	setShard         = "shard"   // shard lease + serialized ShardInfo
+	setExecution     = "exec"    // mutable state, one record per workflow run
+	setCurrent       = "curr"    // current-execution pointer per workflow id
+	setNamespace     = "ns"      // namespace record, keyed by namespace name
+	setNamespaceByID = "nsid"    // namespace id -> name pointer
+	setNamespaceMeta = "nsmeta"  // the single notification_version record
+	setClusterMeta   = "cmeta"   // per-cluster metadata + version
+	setClusterMember = "cmember" // cluster membership, expires via TTL
+	setSchema        = "schema"  // our schema version record
 )
 
 // allSets is used by the test harness to truncate between runs. Keep it in
 // sync as stores are added.
 var allSets = []string{
 	setShard,
+	setExecution,
+	setCurrent,
+	setHistoryTask,
+	setHistoryTree,
+	setHistoryBranch,
+	setHistoryNode,
 	setNamespace,
 	setNamespaceByID,
 	setNamespaceMeta,
@@ -69,6 +77,22 @@ func (k *keyBuilder) shardKey(shardID int32) (*as.Key, error) {
 	return k.newKey(setShard, int(shardID))
 }
 
+// executionKey identifies one workflow run's mutable state. Everything for the
+// run lives in this single record, because a record is Aerospike's unit of
+// placement -- there is no way to co-locate separate records the way
+// Cassandra's shard-keyed partition does.
+func (k *keyBuilder) executionKey(shardID int32, namespaceID, workflowID, runID string) (*as.Key, error) {
+	return k.newKey(setExecution, fmt.Sprintf("%d:%s:%s:%s", shardID, namespaceID, workflowID, runID))
+}
+
+// currentExecutionKey identifies the current-run pointer for a workflow id.
+//
+// The discriminator mirrors Cassandra's per-archetype current record: workflows
+// share one pointer, other CHASM archetypes get their own.
+func (k *keyBuilder) currentExecutionKey(shardID int32, namespaceID, workflowID, discriminator string) (*as.Key, error) {
+	return k.newKey(setCurrent, fmt.Sprintf("%d:%s:%s:%s", shardID, namespaceID, workflowID, discriminator))
+}
+
 // namespaceKey is keyed by namespace *name*, mirroring Cassandra's
 // namespaces_by_name table -- the row that carries the record and its
 // notification version.
@@ -112,7 +136,7 @@ const (
 	binNamespaceID   = "ns_id"     // namespace id (on the name-keyed record)
 	binNotifVersion  = "notif_ver" // namespace notification version
 	binIsGlobal      = "is_global"
-	binVersion       = "version"   // cluster metadata optimistic-lock version
+	binVersion       = "version" // cluster metadata optimistic-lock version
 	binRole          = "role"
 	binRPCAddress    = "rpc_addr"
 	binRPCPort       = "rpc_port"

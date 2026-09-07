@@ -20,8 +20,8 @@ import (
 
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/server/common/log"
-	"go.temporal.io/server/common/persistence/serialization"
 	persistencetests "go.temporal.io/server/common/persistence/persistence-tests"
+	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/persistence/tests"
 
 	"github.com/stefanselent/temporal-meets-aerospike/store/aerospike"
@@ -77,12 +77,65 @@ func TestAerospikeShardStoreSuite(t *testing.T) {
 	))
 }
 
+func TestAerospikeExecutionMutableStateStoreSuite(t *testing.T) {
+	requireAerospike(t)
+
+	factory, tearDown, err := aerospike.NewTestFactory(testLogger())
+	if err != nil {
+		t.Fatalf("creating Aerospike factory: %v", err)
+	}
+	defer tearDown()
+
+	shardStore, err := factory.NewShardStore()
+	if err != nil {
+		t.Fatalf("creating shard store: %v", err)
+	}
+	executionStore, err := factory.NewExecutionStore()
+	if err != nil {
+		t.Fatalf("creating execution store: %v", err)
+	}
+
+	suite.Run(t, tests.NewExecutionMutableStateSuite(
+		t,
+		shardStore,
+		executionStore,
+		serialization.NewSerializer(),
+		testLogger(),
+	))
+}
+
+func TestAerospikeHistoryStoreSuite(t *testing.T) {
+	requireAerospike(t)
+
+	factory, tearDown, err := aerospike.NewTestFactory(testLogger())
+	if err != nil {
+		t.Fatalf("creating Aerospike factory: %v", err)
+	}
+	defer tearDown()
+
+	executionStore, err := factory.NewExecutionStore()
+	if err != nil {
+		t.Fatalf("creating execution store: %v", err)
+	}
+
+	suite.Run(t, tests.NewHistoryEventsSuite(t, executionStore, testLogger()))
+}
+
 // --- Suites over a TestBase (common/persistence/persistence-tests) ---
 
 func TestAerospikeMetadataPersistenceV2(t *testing.T) {
 	requireAerospike(t)
 
 	s := new(persistencetests.MetadataPersistenceSuiteV2)
+	s.TestBase = newTestBase(t)
+	s.TestBase.Setup(nil)
+	suite.Run(t, s)
+}
+
+func TestAerospikeHistoryV2Persistence(t *testing.T) {
+	requireAerospike(t)
+
+	s := new(persistencetests.HistoryV2PersistenceSuite)
 	s.TestBase = newTestBase(t)
 	s.TestBase.Setup(nil)
 	suite.Run(t, s)

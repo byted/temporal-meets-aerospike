@@ -3,6 +3,7 @@ package aerospike
 import (
 	"fmt"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -24,16 +25,16 @@ type client struct {
 
 	// Policies are built once and reused. Allocating a policy per call is an
 	// documented anti-pattern on hot paths.
-	read   *as.BasePolicy
+	read *as.BasePolicy
 	// readLinearize is for shard-ownership reads, where session consistency is
 	// not enough: we must not act on a stale view of who owns the lease.
 	readLinearize *as.BasePolicy
-	write  *as.WritePolicy
-	create *as.WritePolicy // CREATE_ONLY: insert-if-absent
-	replace *as.WritePolicy // REPLACE: full overwrite, drops absent bins
-	delete *as.WritePolicy
-	batch  *as.BatchPolicy
-	info   *as.InfoPolicy
+	write         *as.WritePolicy
+	create        *as.WritePolicy // CREATE_ONLY: insert-if-absent
+	replace       *as.WritePolicy // REPLACE: full overwrite, drops absent bins
+	delete        *as.WritePolicy
+	batch         *as.BatchPolicy
+	info          *as.InfoPolicy
 }
 
 func newClient(cfg *Config) (*client, error) {
@@ -219,7 +220,7 @@ func readBlob(rec *as.Record, dataBin, encBin string) *commonpb.DataBlob {
 	if rec == nil {
 		return nil
 	}
-	data, _ := rec.Bins[dataBin].([]byte)
+	data := asBytes(rec.Bins[dataBin])
 	enc, _ := rec.Bins[encBin].(string)
 	if data == nil {
 		return nil
@@ -257,6 +258,28 @@ func binBool(rec *as.Record, name string) bool {
 }
 
 func binBytes(rec *as.Record, name string) []byte {
-	b, _ := rec.Bins[name].([]byte)
-	return b
+	return asBytes(rec.Bins[name])
+}
+
+// asBytes normalises the shapes the Aerospike client uses for a BLOB value.
+//
+// This is a real trap. The same 16-byte map key comes back as a []byte slice
+// when returned via MapReturnType.KEY, but as a fixed-size [16]uint8 *array*
+// when returned inside a MapPair via MapReturnType.KEY_VALUE. A plain
+// `v.([]byte)` assertion silently fails on the array form and yields an empty
+// result rather than an error, which is exactly as hard to debug as it sounds.
+func asBytes(v any) []byte {
+	switch b := v.(type) {
+	case nil:
+		return nil
+	case []byte:
+		return b
+	}
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Array || rv.Type().Elem().Kind() != reflect.Uint8 {
+		return nil
+	}
+	out := make([]byte, rv.Len())
+	reflect.Copy(reflect.ValueOf(out), rv)
+	return out
 }

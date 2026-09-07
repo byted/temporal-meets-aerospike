@@ -23,45 +23,9 @@ func unimplemented(method string) error {
 	return serviceerror.NewUnimplementedf("aerospike: %s is not implemented yet", method)
 }
 
-// --- ExecutionStore (Phase 2 mutable state, Phase 3 tasks, Phase 4 history) ---
+// Remaining ExecutionStore methods. Phase 3 replaces the task methods, Phase 4
+// the history-event ones.
 
-type executionStore struct{ client *client }
-
-var _ p.ExecutionStore = (*executionStore)(nil)
-
-func newExecutionStore(c *client) *executionStore { return &executionStore{client: c} }
-
-func (s *executionStore) GetName() string { return StoreName }
-func (s *executionStore) Close()          {}
-
-func (s *executionStore) GetHistoryBranchUtil() p.HistoryBranchUtil {
-	return &p.HistoryBranchUtilImpl{}
-}
-
-func (s *executionStore) CreateWorkflowExecution(context.Context, *p.InternalCreateWorkflowExecutionRequest) (*p.InternalCreateWorkflowExecutionResponse, error) {
-	return nil, unimplemented("CreateWorkflowExecution")
-}
-func (s *executionStore) UpdateWorkflowExecution(context.Context, *p.InternalUpdateWorkflowExecutionRequest) error {
-	return unimplemented("UpdateWorkflowExecution")
-}
-func (s *executionStore) ConflictResolveWorkflowExecution(context.Context, *p.InternalConflictResolveWorkflowExecutionRequest) error {
-	return unimplemented("ConflictResolveWorkflowExecution")
-}
-func (s *executionStore) DeleteWorkflowExecution(context.Context, *p.DeleteWorkflowExecutionRequest) error {
-	return unimplemented("DeleteWorkflowExecution")
-}
-func (s *executionStore) DeleteCurrentWorkflowExecution(context.Context, *p.DeleteCurrentWorkflowExecutionRequest) error {
-	return unimplemented("DeleteCurrentWorkflowExecution")
-}
-func (s *executionStore) GetCurrentExecution(context.Context, *p.GetCurrentExecutionRequest) (*p.InternalGetCurrentExecutionResponse, error) {
-	return nil, unimplemented("GetCurrentExecution")
-}
-func (s *executionStore) GetWorkflowExecution(context.Context, *p.GetWorkflowExecutionRequest) (*p.InternalGetWorkflowExecutionResponse, error) {
-	return nil, unimplemented("GetWorkflowExecution")
-}
-func (s *executionStore) SetWorkflowExecution(context.Context, *p.InternalSetWorkflowExecutionRequest) error {
-	return unimplemented("SetWorkflowExecution")
-}
 func (s *executionStore) ListConcreteExecutions(context.Context, *p.ListConcreteExecutionsRequest) (*p.InternalListConcreteExecutionsResponse, error) {
 	// Scavenger-only, and needs a scan with no key scope -- the one access
 	// pattern Aerospike has no good answer for. Out of scope for the PoC.
@@ -95,30 +59,6 @@ func (s *executionStore) RangeDeleteReplicationTaskFromDLQ(context.Context, *p.R
 }
 func (s *executionStore) IsReplicationDLQEmpty(context.Context, *p.GetReplicationTasksFromDLQRequest) (bool, error) {
 	return true, nil
-}
-
-// History events (Phase 4).
-func (s *executionStore) AppendHistoryNodes(context.Context, *p.InternalAppendHistoryNodesRequest) error {
-	return unimplemented("AppendHistoryNodes")
-}
-func (s *executionStore) DeleteHistoryNodes(context.Context, *p.InternalDeleteHistoryNodesRequest) error {
-	return unimplemented("DeleteHistoryNodes")
-}
-func (s *executionStore) ReadHistoryBranch(context.Context, *p.InternalReadHistoryBranchRequest) (*p.InternalReadHistoryBranchResponse, error) {
-	return nil, unimplemented("ReadHistoryBranch")
-}
-func (s *executionStore) ForkHistoryBranch(context.Context, *p.InternalForkHistoryBranchRequest) error {
-	return unimplemented("ForkHistoryBranch")
-}
-func (s *executionStore) DeleteHistoryBranch(context.Context, *p.InternalDeleteHistoryBranchRequest) error {
-	return unimplemented("DeleteHistoryBranch")
-}
-func (s *executionStore) GetHistoryTreeContainingBranch(context.Context, *p.InternalGetHistoryTreeContainingBranchRequest) (*p.InternalGetHistoryTreeContainingBranchResponse, error) {
-	return nil, unimplemented("GetHistoryTreeContainingBranch")
-}
-func (s *executionStore) GetAllHistoryTreeBranches(context.Context, *p.GetAllHistoryTreeBranchesRequest) (*p.InternalGetAllHistoryTreeBranchesResponse, error) {
-	// Scavenger-only; requires an unscoped scan. Out of scope.
-	return nil, unimplemented("GetAllHistoryTreeBranches")
 }
 
 // --- TaskStore (Phase 5) ---
@@ -214,7 +154,7 @@ func (s *queueStore) EnqueueMessageToDLQ(context.Context, *commonpb.DataBlob) (i
 func (s *queueStore) ReadMessagesFromDLQ(context.Context, int64, int64, int, []byte) ([]*p.QueueMessage, []byte, error) {
 	return nil, nil, nil
 }
-func (s *queueStore) DeleteMessageFromDLQ(context.Context, int64) error         { return nil }
+func (s *queueStore) DeleteMessageFromDLQ(context.Context, int64) error              { return nil }
 func (s *queueStore) RangeDeleteMessagesFromDLQ(context.Context, int64, int64) error { return nil }
 func (s *queueStore) UpdateDLQAckLevel(context.Context, *p.InternalQueueMetadata) error {
 	return unimplemented("Queue.UpdateDLQAckLevel")

@@ -180,6 +180,53 @@ Generation CAS still has a place -- for genuine read-modify-write where the whol
 unit of concurrency -- but every condition in this store that mirrors a Cassandra `IF col = value`
 uses a filter expression.
 
+## History events: index record + payload records
+
+Task queues pack into bucketed CDT maps because tasks are small. History nodes are not -- a node
+carries a batch of workflow events and can be megabytes -- so packing them the same way would risk
+the 8 MiB record ceiling and rewrite the whole bucket on every append. Ordering and payload are
+therefore separated.
+
+```mermaid
+flowchart LR
+    subgraph I["hbranch/&lt;tree&gt;:&lt;branch&gt; — the index"]
+        idx["K-ordered map<br/><b>sortKey → prevTxnID</b><br/><i>one small entry per node</i>"]
+    end
+    subgraph D["hnode/&lt;tree&gt;:&lt;branch&gt;:&lt;node&gt;:&lt;txn&gt; — payloads"]
+        n1["events blob"]
+        n2["events blob"]
+        n3["events blob"]
+    end
+    R["ReadHistoryBranch"] -->|"1 · MapGetByKeyRange<br/>ordered + paginated"| idx
+    idx -->|"2 · BatchGet only this page"| D
+    R -.->|"MetadataOnly stops after step 1"| idx
+```
+
+`sortKey` is 16 bytes: `bigendian(nodeID) || bigendian(MaxInt64 - txnID)`. Cassandra clusters
+`node_id ASC, txn_id DESC` because "for the same eventID, the node with the larger TransactionID
+always wins", and the reader depends on seeing that one first — storing the complement of the txn
+id reproduces the descending half under bytewise comparison.
+
+Both records are written in the **same transaction**, so an index entry can never exist without its
+payload. Cassandra appends history nodes *before* its mutable-state batch, as separate
+unconditional writes, so a failed batch orphans them; folding them into one transaction removes
+that failure mode.
+
+## Aerospike client behaviours that will bite you
+
+Four of these cost real debugging time during Phase 2. They are recorded here because none is
+obvious from the API, and each fails *silently* rather than loudly.
+
+| Behaviour | Consequence |
+|---|---|
+| `RecordExistsAction=REPLACE` is incompatible with CDT map operations | `PARAMETER_ERROR`. "Make the record exactly this" has to be expressed as: clear each collection bin, then repopulate, under normal UPDATE semantics. |
+| An ordered map reads back as `[]as.MapPair`, an unordered one as `map[any]any` | Asserting only `map[any]any` yields an **empty collection, not an error**. |
+| A BLOB map key is `[]byte` via `MapReturnType.KEY` but a fixed-size `[16]uint8` **array** inside a `MapPair` via `KEY_VALUE` | `v.([]byte)` silently fails on the array form. Normalise with `asBytes`. |
+| Writing an empty map or empty list | `PARAMETER_ERROR`. Omit the operation, or clear the bin by writing `nil`. |
+
+There is also no `context.Context` anywhere in the client's command API: deadlines are policy
+timeouts only, and a context cancelled mid-command cannot interrupt it.
+
 ## Error mapping
 
 | Aerospike condition | Temporal error |

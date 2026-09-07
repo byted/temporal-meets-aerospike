@@ -6,8 +6,10 @@ import (
 	"time"
 
 	"go.temporal.io/server/common/config"
+	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
+	"go.temporal.io/server/common/primitives"
 )
 
 // TestCluster implements persistencetests.PersistenceTestCluster so Temporal's
@@ -65,7 +67,7 @@ func NewTestCluster(logger log.Logger) *TestCluster {
 // DataStoreFactoryProvider. The customDatastore block is what routes it here.
 func (t *TestCluster) Config() config.Persistence {
 	return config.Persistence{
-		DefaultStore:    "aerospike-test",
+		DefaultStore:     "aerospike-test",
 		NumHistoryShards: 4,
 		DataStores: map[string]config.DataStore{
 			"aerospike-test": {
@@ -80,6 +82,10 @@ func (t *TestCluster) Config() config.Persistence {
 				},
 			},
 		},
+		// Required: the ExecutionManager dereferences this on every
+		// AppendHistoryNodes. Leaving it nil panics inside Temporal rather
+		// than failing in the store.
+		TransactionSizeLimit: dynamicconfig.GetIntPropertyFn(primitives.DefaultTransactionSizeLimit),
 	}
 }
 

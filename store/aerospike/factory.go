@@ -39,7 +39,7 @@ func (f *AbstractFactory) NewFactory(
 	// This signature cannot report an error, and Temporal calls it during fx
 	// graph construction. A misconfiguration here is not recoverable and must
 	// not surface later as a confusing nil dereference, so fail loudly.
-	factory, err := NewFactory(cfg, clusterName, logger)
+	factory, err := NewFactory(cfg, clusterName, logger, serializer)
 	if err != nil {
 		logger.Fatal("unable to initialize the Aerospike persistence store", tag.Error(err))
 	}
@@ -56,11 +56,17 @@ type Factory struct {
 	client      *client
 	clusterName string
 	logger      log.Logger
+	serializer  serialization.Serializer
 }
 
 var _ p.DataStoreFactory = (*Factory)(nil)
 
-func NewFactory(cfg config.CustomDatastoreConfig, clusterName string, logger log.Logger) (*Factory, error) {
+func NewFactory(
+	cfg config.CustomDatastoreConfig,
+	clusterName string,
+	logger log.Logger,
+	serializer serialization.Serializer,
+) (*Factory, error) {
 	parsed, err := NewConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -86,7 +92,7 @@ func NewFactory(cfg config.CustomDatastoreConfig, clusterName string, logger log
 		tag.NewStringTag("schema-version", Version),
 	)
 
-	return &Factory{client: c, clusterName: clusterName, logger: logger}, nil
+	return &Factory{client: c, clusterName: clusterName, logger: logger, serializer: serializer}, nil
 }
 
 // NewFactoryForTest builds a factory directly from a parsed config, skipping
@@ -102,7 +108,12 @@ func NewFactoryForTest(cfg *Config, clusterName string, logger log.Logger) (*Fac
 		c.Close()
 		return nil, err
 	}
-	return &Factory{client: c, clusterName: clusterName, logger: logger}, nil
+	return &Factory{
+		client:      c,
+		clusterName: clusterName,
+		logger:      logger,
+		serializer:  serialization.NewSerializer(),
+	}, nil
 }
 
 func (f *Factory) Close() {
@@ -125,7 +136,7 @@ func (f *Factory) NewClusterMetadataStore() (p.ClusterMetadataStore, error) {
 }
 
 func (f *Factory) NewExecutionStore() (p.ExecutionStore, error) {
-	return newExecutionStore(f.client), nil
+	return newExecutionStore(f.client, f.serializer), nil
 }
 
 func (f *Factory) NewTaskStore() (p.TaskStore, error) {

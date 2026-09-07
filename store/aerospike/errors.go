@@ -37,8 +37,8 @@ func convertError(operation string, err error) error {
 		return &persistenceTimeout{operation: operation, err: err}
 
 	case asErr.Matches(
-		types.KEY_BUSY,          // too many concurrent commands on one key
-		types.MRT_BLOCKED,       // another transaction holds the record
+		types.KEY_BUSY,    // too many concurrent commands on one key
+		types.MRT_BLOCKED, // another transaction holds the record
 		types.MRT_ALREADY_LOCKED,
 		types.DEVICE_OVERLOAD,
 		types.SERVER_NOT_AVAILABLE,

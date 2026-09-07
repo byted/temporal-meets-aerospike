@@ -81,6 +81,39 @@ with (a); if assertions on the returned fields are flaky, switch to (b).
 
 ## Resolved
 
+### R12 — Phase order: mutable state and history events are coupled
+
+*Resolved 2026-09-07, Phase 2.*
+
+The plan sequenced history events as Phase 4, after history tasks. `ExecutionMutableStateSuite`
+does not permit that: `CreateWorkflowExecution` carries `NewWorkflowNewEvents`, and the suite reads
+the history back, so 35 of its 45 tests fail until the history store exists. Phases 2 and 4 were
+therefore implemented together. Phase 3 (history tasks) remains independent.
+
+The suites are the authority on sequencing, not the plan.
+
+### R11 — `GetAllHistoryTreeBranches` is needed after all
+
+*Resolved 2026-09-07, Phase 2.*
+
+Scoped out as scavenger-only, but `HistoryV2PersistenceSuite` uses it for cleanup, and four tests
+fail without it. Implemented as a full set scan — genuinely the one access pattern Aerospike cannot
+serve well, since there is no key scope to narrow it.
+
+Acceptable because nothing on the workflow execution path calls it. A production deployment would
+want an external index, or a maintenance job driven by `PartitionFilter` so the scan parallelises
+and resumes.
+
+### R10 — Aerospike client traps that fail silently
+
+*Resolved 2026-09-07, Phase 2.* Full table in
+[03-data-model.md](03-data-model.md#aerospike-client-behaviours-that-will-bite-you).
+
+The expensive ones: `REPLACE` is incompatible with CDT operations; ordered maps read back as
+`[]MapPair` while unordered ones read back as `map[any]any`; and a BLOB map key arrives as `[]byte`
+from `MapReturnType.KEY` but as a `[16]uint8` **array** inside a `MapPair`. All three fail as empty
+results rather than errors, which is what made them costly.
+
 ### R9 — Aerospike does not store the user key by default
 
 *Resolved 2026-09-07, Phase 1.*
