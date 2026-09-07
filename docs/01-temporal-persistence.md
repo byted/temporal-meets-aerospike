@@ -97,6 +97,43 @@ Error types we must reproduce faithfully — these drive Temporal's own retry lo
 The last one is the subtle one. Cassandra gets the conflicting row back for free from the LWT's
 returned `previous` map. Aerospike does not, so every failure path needs an explicit read-back.
 
+## Which task categories are optional? (Almost none)
+
+Worth settling before scoping, because it is tempting to assume timers are a `workflow.Sleep()`
+feature that a minimal PoC could skip. They are not.
+
+`CategoryTimer` carries twelve task types, and exactly **one** of them — `user_timer.go` — is the
+user-facing sleep. The rest are infrastructure:
+
+```mermaid
+flowchart TB
+    subgraph F["Fundamental — fire on the plain happy path"]
+        wtt["workflow_task_timer<br/><i>ScheduleToStart + StartToClose<br/>on every workflow task</i>"]
+        att["activity_task_timer<br/><i>ScheduleToStart · StartToClose<br/>ScheduleToClose · Heartbeat</i>"]
+        art["activity_retry_timer<br/><i>retry backoff</i>"]
+        wrt["workflow_run_timer ·<br/>workflow_execution_timer"]
+        wct["workflow_cleanup_timer<br/><i>retention after close</i>"]
+    end
+    subgraph O["Optional — user-facing"]
+        ut["user_timer<br/><i>workflow.Sleep()</i>"]
+    end
+```
+
+`GenerateStartWorkflowTaskTasks` calls `AddTasks` with a `WorkflowTaskTimeoutTask`
+unconditionally for every non-speculative workflow task
+(`service/history/workflow/task_generator.go`), and `timer_sequence.go` adds an
+`ActivityTimeoutTask` for every activity's first pending timeout. So a workflow with one activity
+and no sleeps still writes timer tasks.
+
+**And at the persistence layer there is no distinction between them anyway.** Every timer task is
+an opaque blob in `CategoryTimer`, keyed by `(visibility_ts, task_id)`. The store cannot tell a
+`workflow.Sleep()` from an activity timeout, so declining to support the former saves exactly zero
+work.
+
+One nuance: *speculative* workflow tasks use an in-memory timer queue
+(`SetSpeculativeWorkflowTaskTimeoutTask`) and are never persisted — that is what `CategoryMemory`
+is for.
+
 ## The range-scan requirement
 
 `GetHistoryTasks` asks for *"tasks for shard N, category C, key in `[min, max)`, in ascending key

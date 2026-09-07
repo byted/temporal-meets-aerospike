@@ -107,17 +107,33 @@ exactly as Cassandra's compound clustering key does.
 Aerospike 8.1.2.4 starts cleanly with it in the `namespace` stanza. A config error would have been
 fatal and immediate.
 
-### R5 — Emulation trap on Apple Silicon
+### R5 — Architecture: three layers, keep them straight
 
 *Resolved 2026-09-07, Phase 0.*
 
-Aerospike publishes multi-arch images, but a `DOCKER_DEFAULT_PLATFORM=linux/amd64` in the shell
-overrides the host default and silently gets you an x86_64 server under qemu. Observed cost:
-`asinfo -v build` took **6.0s** emulated vs **0.33s** native.
+There are three separate architecture decisions in this project and they are easy to conflate:
 
-Mitigated by the `TMA_PLATFORM` override in `deploy/docker-compose.yml` plus
-`deploy/.env.example`. Harmless in Iteration 1, **fatal to Iteration 2** — any throughput number
-measured under emulation is meaningless. See [05](05-iteration-2-3-sketch.md).
+| Layer | What runs there | Architecture |
+|---|---|---|
+| Host tools | `go test ./conformance`, `go vet`, the capability tests | `darwin/arm64` — native, follows the Mac |
+| Containers | Aerospike, Elasticsearch, the UI, init containers | `linux/<arch>`, chosen by Docker |
+| Our server binary | built *inside* a container by `deploy/Dockerfile` | inherits that container's arch |
+
+On Apple Silicon, Docker Desktop's Linux VM is itself **arm64**; amd64 images run translated
+inside it. So a native arm64 container is the default — *unless* `DOCKER_DEFAULT_PLATFORM` is set
+in the shell, which overrides the host default for every container with no warning. That was the
+case here, and it is a reasonable thing to have set globally for other projects.
+
+Measured cost of getting it wrong: `asinfo -v build` took **6.0s** emulated vs **0.33s** native.
+
+Mitigated by `platform: ${TMA_PLATFORM:-}` on **every** service in
+`deploy/docker-compose.yml` plus `deploy/.env.example`. Applied uniformly on purpose — a stack
+with an arm64 database and an emulated amd64 server works fine and quietly produces nonsense
+numbers. All six images publish both architectures, so either choice is valid as long as it is
+consistent.
+
+Harmless in Iteration 1, **fatal to Iteration 2** — any throughput number measured under
+emulation is meaningless. See [05](05-iteration-2-3-sketch.md).
 
 ### R4 — Do MRT, generation CAS and CDT ordering behave as documented? — **Yes, all verified**
 
