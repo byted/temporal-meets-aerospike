@@ -426,3 +426,71 @@ go test ./conformance/...
 kubectl delete namespace tma      # takes the PVC with it
 k3d cluster delete tma            # k3d: the whole cluster, images and all
 ```
+
+
+## Deploying to a Civo VPS (what was actually done)
+
+A Civo Compute instance with k3s installed by hand, not Civo's managed
+Kubernetes. The reason is image delivery: Civo
+[does not support SSH to managed Kubernetes nodes](https://www.civo.com/docs/faq),
+which removes `k3s ctr images import` and building on the box, leaving only
+"push to a registry" for two images this project never pushes anywhere. A plain
+instance keeps this README working as written and is cheaper than a managed node
+plus the load balancer its ingress needs.
+
+Target used: `g4s.large` — 4 vCPU, 8 GB, Ubuntu 24.04, amd64. **8 GB, not 4.**
+The ceilings sum to roughly 5.5 GB (Aerospike `filesize 2G`, Temporal's 1536Mi
+limit, and k3s wanting 2 GB for a server node), so a 4 GB box runs out of
+headroom exactly when someone is watching.
+
+```sh
+# 1. k3s. Brings Traefik and local-path with it, so ingress and the PVC need
+#    nothing further.
+curl -sfL https://get.k3s.io | sudo sh -s - --write-kubeconfig-mode 644
+
+# 2. A builder. Build on the box: it is amd64, and cross-building from an
+#    arm64 laptop under emulation is far slower.
+sudo apt-get update && sudo apt-get install -y docker.io
+sudo usermod -aG docker "$USER"
+
+# 3. Ship the source and build both images natively.
+rsync -az --exclude .git ./ user@BOX:~/tma/
+ssh user@BOX 'cd ~/tma
+  sudo docker build -f deploy/Dockerfile               -t temporal-meets-aerospike/server:dev        .
+  sudo docker build -f deploy/Dockerfile.control-plane -t temporal-meets-aerospike/control-plane:dev .
+  sudo docker save temporal-meets-aerospike/server:dev        | sudo k3s ctr images import -
+  sudo docker save temporal-meets-aerospike/control-plane:dev | sudo k3s ctr images import -'
+
+# 4. Apply, then create both credentials ON the box so they never reach git.
+sudo k3s kubectl apply -f deploy/k8s/
+PASS=$(openssl rand -base64 18)
+sudo k3s kubectl -n tma create secret generic control-plane-auth \
+  --from-literal=username=demo --from-literal=password="$PASS" \
+  --dry-run=client -o yaml | sudo k3s kubectl apply -f -
+sudo k3s kubectl -n tma create secret generic ingress-basic-auth \
+  --from-literal=users="demo:$(openssl passwd -apr1 "$PASS")" \
+  --dry-run=client -o yaml | sudo k3s kubectl apply -f -
+```
+
+All four pods were ready 30 seconds after apply.
+
+**Two credentials, deliberately.** `control-plane-auth` is the Go service's own
+check; `ingress-basic-auth` backs the Traefik middleware in
+[`45-ingress-auth.yaml`](45-ingress-auth.yaml). The second is not redundant: the
+ingress routes `/temporal` straight to the Temporal Web UI, which never runs the
+Go service's auth code. Without the middleware that UI is world-readable and
+world-terminatable. Verify with an unauthenticated request — `/`, `/temporal`
+and `/api/state` must all return 401.
+
+**Civo's firewall** must allow 80 and 443 inbound; SSH alone is the default on
+some profiles.
+
+### TLS
+
+Until a certificate is installed the basic-auth password crosses the wire in
+plaintext on every request. Do not circulate the URL before TLS is on.
+
+`<IP>.sslip.io` resolves to the address with no DNS setup and satisfies an
+ACME HTTP-01 challenge, which is enough for a throwaway box. For a real
+hostname, point an A record at the instance and follow the cert-manager notes at
+the bottom of [`50-ingress.yaml`](50-ingress.yaml).

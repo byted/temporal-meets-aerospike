@@ -15,6 +15,10 @@ metadata:
   namespace: tma
   labels:
     app.kubernetes.io/part-of: temporal-meets-aerospike
+  annotations:
+    # Applies to every path below, including /temporal -- which bypasses the
+    # control plane's own auth entirely. See 45-ingress-auth.yaml.
+    traefik.ingress.kubernetes.io/router.middlewares: tma-demo-auth@kubernetescrd
 spec:
   ingressClassName: traefik
   rules:
