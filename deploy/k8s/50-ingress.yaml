@@ -1,9 +1,10 @@
 # Traefik ships with k3s and is already the default IngressClass, so this needs
 # no controller install.
 #
-# No `host:` rule. The demo box is reached by IP or by whatever DNS name someone
-# points at it that day, and a host rule would silently 404 the moment that
-# changed. Add one when you add TLS -- cert-manager needs it anyway.
+# A `host:` rule is required now that TLS is on: cert-manager derives the
+# certificate's names from it, and Traefik needs it to select the right
+# certificate. Reaching the box by bare IP therefore 404s, which is the
+# trade-off for having a certificate at all.
 #
 # Path routing, not prefix stripping: /temporal reaches ui-server *with* the
 # prefix intact, and ui-server is told about it via TEMPORAL_UI_PUBLIC_PATH.
@@ -18,11 +19,21 @@ metadata:
   annotations:
     # Applies to every path below, including /temporal -- which bypasses the
     # control plane's own auth entirely. See 45-ingress-auth.yaml.
-    traefik.ingress.kubernetes.io/router.middlewares: tma-demo-auth@kubernetescrd
+    # Order matters: redirect to HTTPS first, so an http:// request is never
+    # asked for a password over plaintext.
+    traefik.ingress.kubernetes.io/router.middlewares: tma-redirect-https@kubernetescrd,tma-demo-auth@kubernetescrd
+    # Switch to letsencrypt-staging when testing changes to this ingress, so a
+    # broken solver does not burn the production rate limit.
+    cert-manager.io/cluster-issuer: letsencrypt
 spec:
   ingressClassName: traefik
+  tls:
+    - hosts:
+        - temporal-meets-aerospike.example.com
+      secretName: demo-tls
   rules:
-    - http:
+    - host: temporal-meets-aerospike.example.com
+      http:
         paths:
           - path: /temporal
             pathType: Prefix

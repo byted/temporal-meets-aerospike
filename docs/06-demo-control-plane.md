@@ -70,6 +70,25 @@ sequenceDiagram
 Skip the namespace registration and "Run workflow" fails immediately after every switch, with an
 error that points nowhere useful.
 
+## The first run after a switch is slow, so the switch absorbs it
+
+Measured on the deployed box: the first workflow after a switch took **43 s**, against ~50 ms
+steady state. It does not happen every time, which makes it worse — the demo's whole claim is that
+the workflow behaves identically on either store, and an unexplained 40-second hang after clicking
+**Run workflow** reads as broken rather than as a cold start.
+
+The cause is a task queue that matching has just had to create while a poller was already
+long-polling it. Rather than leave it to chance, `runSwitch` executes one throwaway workflow before
+reporting the switch complete.
+
+The trade-off is explicit: **the switch goes from ~15 s to ~69 s**, and the presenter's next click
+is ~45 ms. The same wall-clock time is spent either way; this spends it against a live progress log,
+where waiting is expected, instead of behind a button that is supposed to feel instant.
+
+If a fast switch matters more than a fast first click, drop the warm-up block in
+`control/server.go` — it is deliberately self-contained, and a warm-up failure never fails the
+switch.
+
 ## Deliberate scope
 
 - **No data migration.** Switching stores means the previous store's workflows are simply not there.
@@ -112,4 +131,9 @@ AEROSPIKE_NAMESPACE=temporal PORT=8090 go run ./cmd/control-plane
 Everything works except the switch, which needs Kubernetes. The UI also runs standalone against
 canned data with `?mock=1` — see `control/web/mock/`.
 
-On a box: [deploy/k8s/README.md](../deploy/k8s/README.md).
+On a box: [deploy/k8s/README.md](../deploy/k8s/README.md), which documents the Civo deployment
+including k3s install, native image builds, both credentials, and TLS via cert-manager.
+
+Deployed at `https://temporal-meets-aerospike.example.com` behind basic auth, with a Let's
+Encrypt certificate and an HTTP-to-HTTPS redirect ahead of the auth middleware, so credentials are
+never requested over plaintext.

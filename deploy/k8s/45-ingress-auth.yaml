@@ -30,3 +30,23 @@ spec:
     # Traefik accepts MD5 (apr1), SHA1 or bcrypt hashes here.
     secret: ingress-basic-auth
     realm: "Temporal on Aerospike — demo"
+
+---
+# Redirect http:// to https://.
+#
+# Without this the ingress happily answers on port 80, so a plain-HTTP request
+# is challenged for basic auth and the password crosses the wire in clear text.
+# The redirect must run BEFORE the auth middleware -- middlewares apply in the
+# order listed on the router, and redirecting first means an http:// visitor is
+# never asked for credentials over an unencrypted connection.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-https
+  namespace: tma
+  labels:
+    app.kubernetes.io/part-of: temporal-meets-aerospike
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true

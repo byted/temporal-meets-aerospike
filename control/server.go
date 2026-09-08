@@ -318,6 +318,28 @@ func (s *Server) runSwitch(ctx context.Context, target Backend) error {
 		return err
 	}
 
+	// Warm the task queue before declaring the switch done.
+	//
+	// The first workflow after a switch is intermittently slow -- measured at
+	// 43s against ~50ms steady state, on a task queue that matching has just
+	// had to create while a poller was already long-polling it. It does not
+	// happen every time, which makes it worse: the demo's whole claim is that
+	// the workflow behaves identically on either store, and an unexplained
+	// 40-second hang after clicking Run reads as broken.
+	//
+	// Absorbing it here costs the same wall-clock time but spends it where
+	// waiting is expected and visible, against a live progress log.
+	//
+	// Best-effort: a warm-up failure is not a switch failure. The store is
+	// already serving at this point, and reporting otherwise would be wrong.
+	report("warming up the task queue")
+	warmCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	if _, err := s.runner.Run(warmCtx); err != nil {
+		s.logger.Warn("task queue warm-up failed; the first run may be slow", "error", err)
+		report("warm-up did not complete; the first run may be slow")
+	}
+	cancel()
+
 	report(fmt.Sprintf("now running on %s", target))
 	return nil
 }
