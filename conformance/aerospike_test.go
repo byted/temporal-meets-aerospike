@@ -25,7 +25,7 @@ import (
 	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/persistence/tests"
 
-	"github.com/stefanselent/temporal-meets-aerospike/store/aerospike"
+	"github.com/byted/temporal-meets-aerospike/store/aerospike"
 )
 
 // requireAerospike skips rather than fails when no node is reachable, so that

@@ -22,7 +22,7 @@ import (
 	// without rebuilding.
 	_ "go.temporal.io/server/common/persistence/sql/sqlplugin/sqlite"
 
-	"github.com/stefanselent/temporal-meets-aerospike/store/aerospike"
+	"github.com/byted/temporal-meets-aerospike/store/aerospike"
 )
 
 func main() {

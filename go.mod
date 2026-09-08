@@ -1,4 +1,4 @@
-module github.com/stefanselent/temporal-meets-aerospike
+module github.com/byted/temporal-meets-aerospike
 
 go 1.26.4
 

@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/stefanselent/temporal-meets-aerospike/control"
+	"github.com/byted/temporal-meets-aerospike/control"
 )
 
 func main() {

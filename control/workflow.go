@@ -15,7 +15,7 @@ import (
 	"go.temporal.io/sdk/worker"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/stefanselent/temporal-meets-aerospike/e2e"
+	"github.com/byted/temporal-meets-aerospike/e2e"
 )
 
 // demoRetention is the namespace retention period. Short: the demo namespace
