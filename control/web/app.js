@@ -31,9 +31,12 @@ if (MOCK) {
 const POLL_MS          = 2000;   // state + aerospike refresh cadence
 const REQ_TIMEOUT_MS   = 8000;   // normal request budget
 const RUN_TIMEOUT_MS   = 120000; // a workflow run may legitimately take a while
-const BATCH_SIZE       = 100;
-// 100 runs at 10 concurrent is a couple of seconds normally, but the same
-// stall that affects a single run applies here, so allow generous headroom.
+// Three orders of magnitude. 1 is the single-run path; 10 and 100 go through
+// the batch endpoint, which caps concurrency server-side.
+const BATCH_SIZES      = [10, 100];
+// Each workflow now sleeps 10s on a durable timer, so 100 runs at 50 concurrent
+// is two rounds — a little over 20s. The stall that can affect a single run
+// applies here too, so keep generous headroom.
 const BATCH_TIMEOUT_MS = 300000;
 const SSE_RETRY_MS     = 2000;   // manual reconnect delay once EventSource gives up
 const MAX_RUNS         = 12;
@@ -55,7 +58,8 @@ const el = {
   stepper:       $('stepper'),
 
   btnRun:        $('btn-run'),
-  btnRunBatch:   $('btn-run-batch'),
+  btnRun10:      $('btn-run-10'),
+  btnRun100:     $('btn-run-100'),
   hintRun:       $('hint-run'),
   runsBody:      $('runs-body'),
   runsEmpty:     $('runs-empty'),
@@ -102,7 +106,7 @@ const state = {
   expectDown:    false,     // downtime is expected -> not an error
   running:       false,     // a workflow run is in flight
   switchPending: false,     // the POST /api/switch itself is in flight
-  batchRunning:  false,     // a bulk run is in flight
+  batchRunning:  0,         // size of the bulk run in flight, 0 when idle
   resetPending:  false,     // the POST /api/reset itself is in flight
   confirmReset:  false,     // the destructive-action confirmation is showing
 
@@ -414,17 +418,17 @@ async function runWorkflow() {
 
 // A batch adds ONE summary row, not a hundred. The run table exists to make the
 // store-per-run contrast readable; a hundred identical greetings would bury it.
-async function runBatch() {
+async function runBatch(size) {
   if (state.running || state.batchRunning || isSwitching() || !state.serverUp) return;
-  state.batchRunning = true;
+  state.batchRunning = size;
   render();
-  log('local', `Starting ${BATCH_SIZE} workflows…`);
+  log('local', `Starting ${size} workflows…`);
 
   const t0 = performance.now();
   try {
     const r = await api('/api/workflow/run-batch', {
       method: 'POST',
-      body: JSON.stringify({ count: BATCH_SIZE }),
+      body: JSON.stringify({ count: size }),
       timeout: BATCH_TIMEOUT_MS,
     });
     const store = r?.persistenceStore || state.backend || 'unknown';
@@ -433,7 +437,7 @@ async function runBatch() {
       ok:         failed === 0,
       store,
       batch:      true,
-      workflowId: `${r?.completed ?? 0}/${r?.requested ?? BATCH_SIZE} workflows`,
+      workflowId: `${r?.completed ?? 0}/${r?.requested ?? size} workflows`,
       runId:      '',
       result:     failed === 0
         ? `all completed · fastest ${r?.fastestMs ?? '?'}ms, slowest ${r?.slowestMs ?? '?'}ms`
@@ -441,11 +445,11 @@ async function runBatch() {
       durationMs: typeof r?.durationMs === 'number' ? r.durationMs : Math.round(performance.now() - t0),
     });
     log(failed === 0 ? 'progress' : 'error',
-        `${r?.completed ?? 0}/${r?.requested ?? BATCH_SIZE} workflows completed on ${backendLabel(store)} in ${r?.durationMs ?? '?'}ms`);
+        `${r?.completed ?? 0}/${r?.requested ?? size} workflows completed on ${backendLabel(store)} in ${r?.durationMs ?? '?'}ms`);
   } catch (err) {
     log('error', `Batch failed: ${err.message || err}`);
   } finally {
-    state.batchRunning = false;
+    state.batchRunning = 0;
     render();
     scheduleTick(150);
   }
@@ -598,13 +602,16 @@ function renderStepper() {
 function renderActions() {
   // Run workflow
   const runBlocked = isSwitching() || state.serverUp === false;
-  el.btnRun.disabled = runBlocked || state.running || state.batchRunning;
+  const anyRunning = state.running || state.batchRunning > 0;
+  el.btnRun.disabled = runBlocked || anyRunning;
   el.btnRun.dataset.busy = String(state.running);
 
-  el.btnRunBatch.disabled = runBlocked || state.running || state.batchRunning;
-  el.btnRunBatch.dataset.busy = String(state.batchRunning);
-  el.btnRunBatch.querySelector('.btn-label').textContent =
-    state.batchRunning ? `Running ${BATCH_SIZE}…` : `Run ${BATCH_SIZE}`;
+  for (const [size, btn] of [[BATCH_SIZES[0], el.btnRun10], [BATCH_SIZES[1], el.btnRun100]]) {
+    btn.disabled = runBlocked || anyRunning;
+    btn.dataset.busy = String(state.batchRunning === size);
+    btn.querySelector('.btn-label').textContent =
+      state.batchRunning === size ? `Running ${size}…` : `Run ${size}`;
+  }
   el.btnRun.querySelector('.btn-label').textContent =
     state.running ? 'Running…' : 'Run workflow';
 
@@ -766,6 +773,10 @@ function renderRules() {
 
 /* ── the bucket view ───────────────────────────────────────────────────── */
 
+// Shards the viewer has expanded. Survives the subtree rebuild that happens
+// whenever the history-task payload changes.
+const openShards = new Set();
+
 let htaskSig = '';
 function renderHtask() {
   const data = state.htask;
@@ -797,19 +808,39 @@ function renderHtask() {
   for (const shard of shards) el.htask.appendChild(shardBlock(shard, bucketing));
 }
 
+// Shards are collapsed by default.
+//
+// A busy store has four shards of several categories of many buckets each, and
+// all of it expanded is a wall. Native <details> rather than a JS toggle: it is
+// keyboard accessible and needs no state of its own — which matters because
+// this subtree is rebuilt whenever the payload changes, and any open/closed
+// state kept in JS would be lost on every poll. Open shards are remembered in
+// `openShards` and reapplied, so a shard you expanded stays expanded while the
+// counts underneath it keep moving.
 function shardBlock(shard, bucketing) {
-  const sec = document.createElement('section');
+  const sec = document.createElement('details');
   sec.className = 'shard';
+  sec.open = openShards.has(String(shard.shardId));
+  sec.addEventListener('toggle', () => {
+    if (sec.open) openShards.add(String(shard.shardId));
+    else openShards.delete(String(shard.shardId));
+  });
 
-  const head = document.createElement('header');
+  const cats = Array.isArray(shard.categories) ? shard.categories : [];
+  const buckets = cats.reduce((n, c) => n + (c.buckets?.length || 0), 0);
+  const entries = cats.reduce(
+    (n, c) => n + (c.buckets || []).reduce((m, b) => m + (b.count || 0), 0), 0);
+
+  const head = document.createElement('summary');
   head.className = 'shard-head';
   head.innerHTML = `
     <span class="shard-badge">shard <b>${esc(shard.shardId)}</b></span>
+    <span class="shard-counts">${esc(buckets)} bucket${buckets === 1 ? '' : 's'} ·
+      ${esc(entries)} task${entries === 1 ? '' : 's'}</span>
     <span class="shard-note">Cassandra would keep all of this in one partition keyed
       <code>shard_id = ${esc(shard.shardId)}</code>.</span>`;
   sec.appendChild(head);
 
-  const cats = Array.isArray(shard.categories) ? shard.categories : [];
   for (const cat of cats) sec.appendChild(categoryBlock(shard, cat, bucketing));
   if (cats.length === 0) sec.appendChild(emptyLine('No task categories in this shard.'));
   return sec;
@@ -1003,7 +1034,8 @@ function emptyLine(text) {
 /* ── wiring ────────────────────────────────────────────────────────────── */
 
 el.btnRun.addEventListener('click', runWorkflow);
-el.btnRunBatch.addEventListener('click', runBatch);
+el.btnRun10.addEventListener('click', () => runBatch(BATCH_SIZES[0]));
+el.btnRun100.addEventListener('click', () => runBatch(BATCH_SIZES[1]));
 el.btnSwitch.addEventListener('click', startSwitch);
 el.btnReset.addEventListener('click', askReset);
 el.btnResetCancel.addEventListener('click', cancelReset);

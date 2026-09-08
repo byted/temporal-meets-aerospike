@@ -71,10 +71,14 @@
       <div class="panel-body">
         <div class="action-row">
           <button class="btn primary" id="btn-run" type="button">
-            <span class="btn-label">Run workflow</span>
+            <span class="btn-label">Run 1</span>
             <span class="spinner" aria-hidden="true"></span>
           </button>
-          <button class="btn secondary" id="btn-run-batch" type="button">
+          <button class="btn secondary" id="btn-run-10" type="button">
+            <span class="btn-label">Run 10</span>
+            <span class="spinner" aria-hidden="true"></span>
+          </button>
+          <button class="btn secondary" id="btn-run-100" type="button">
             <span class="btn-label">Run 100</span>
             <span class="spinner" aria-hidden="true"></span>
           </button>
@@ -93,7 +97,7 @@
             </thead>
             <tbody id="runs-body"></tbody>
           </table>
-          <p class="empty" id="runs-empty">No runs yet. Press <strong>Run workflow</strong>.</p>
+          <p class="empty" id="runs-empty">No runs yet. Press <strong>Run 1</strong>.</p>
           <p class="runs-note">The store tag is what the control plane reported for that run, and the
             result text is produced by the activity itself — the workflow names the store it ran on.</p>
         </div>

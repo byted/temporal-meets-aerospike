@@ -1181,3 +1181,37 @@ tr.run-row-fresh { animation: flashin .8s ease-out; }
     transition-duration: .001ms !important;
   }
 }
+
+
+/* --- collapsible shards ---------------------------------------------------
+   The shard block became a <details>, so the marker needs taming and the
+   summary needs to look like the header it replaced. */
+.shard > summary.shard-head {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.shard > summary.shard-head::-webkit-details-marker { display: none; }
+.shard > summary.shard-head::before {
+  content: "\25B8";                 /* right-pointing triangle */
+  display: inline-block;
+  margin-right: .55em;
+  color: var(--muted);
+  transition: transform .12s ease;
+}
+.shard[open] > summary.shard-head::before { transform: rotate(90deg); }
+.shard > summary.shard-head:hover { background: var(--surface-2); }
+.shard > summary.shard-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* Counts stay visible while collapsed -- the point of collapsing is to see
+   which shards are worth opening. */
+.shard-counts {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  font-size: .92em;
+  margin-right: .6em;
+  white-space: nowrap;
+}

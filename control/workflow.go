@@ -86,12 +86,18 @@ type BatchResult struct {
 
 // batchConcurrency caps how many demo workflows are in flight at once.
 //
-// Not 100. The demo box is 4 vCPU, and Q7 in docs/04-open-questions.md records
-// an unexplained stall that reproduces specifically under CPU contention --
-// firing a hundred concurrent starts is the most reliable way to manufacture
-// exactly that condition in front of an audience. Ten keeps the box busy enough
-// to be interesting and finishes 100 runs in a couple of seconds.
-const batchConcurrency = 10
+// Raised from 10 once the workflow gained a 10s durable timer. A sleeping
+// workflow costs nothing while it waits -- the load is the start and the
+// completion, not the middle -- so a low cap now buys no safety and just makes
+// a batch of 100 take ten rounds of ten seconds.
+//
+// Still not 100. The demo box is 4 vCPU and Q7 in docs/04-open-questions.md
+// records an unexplained stall that reproduces specifically under CPU
+// contention, and a hundred simultaneous starts is the most reliable way to
+// manufacture that in front of an audience. Fifty puts a batch of 100 at two
+// rounds, so it finishes in a little over twenty seconds while the bucket view
+// visibly fills.
+const batchConcurrency = 50
 
 // RunBatch executes count demo workflows, at most batchConcurrency at a time.
 //

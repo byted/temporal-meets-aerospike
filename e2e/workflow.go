@@ -40,7 +40,28 @@ type GreetResult struct {
 // execution pointer, history events, transfer tasks for the workflow and
 // activity dispatch, timer tasks for the workflow-task and activity timeouts,
 // and matching task queues.
+// DemoSleep is how long the workflow sleeps before doing its work.
+//
+// It exists for the demo rather than for the workflow. A durable timer is the
+// one thing that writes to a *scheduled* task category, and scheduled tasks are
+// where the interesting half of the data model lives: they key on a 16-byte
+// big-endian fireTime||taskID blob, bucketed one minute at a time, so bytewise
+// order equals (fireTime, taskID). Without a sleep the store only ever holds
+// immediate tasks and the bucket view has nothing to show for half of what
+// docs/03-data-model.md describes.
+//
+// Ten seconds also spreads a batch across more than one 60-second bucket when
+// the runs are staggered, which is the point of having buckets at all.
+const DemoSleep = 10 * time.Second
+
 func Greet(ctx workflow.Context, name string) (GreetResult, error) {
+	// A durable timer, not a Go sleep: this is workflow code, so the wait has
+	// to survive a worker restart and be replayable. It becomes a timer task in
+	// the persistence store, which is the whole reason it is here.
+	if err := workflow.Sleep(ctx, DemoSleep); err != nil {
+		return GreetResult{}, err
+	}
+
 	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: 10 * time.Second,
 	})

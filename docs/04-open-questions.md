@@ -132,6 +132,36 @@ Neither fixes this, but both are correct for a single-worker deployment. The 90 
 
 ---
 
+## Q8 — The store surfaces `MRT_BLOCKED` instead of retrying it
+
+**Status:** open · raised 2026-09-08
+
+`TestConcurrentlyForkAndAppendBranches` failed once with:
+
+```
+AppendHistoryNodes: ResultCode: MRT_BLOCKED ... Transaction record blocked by
+a different transaction (retryable)
+```
+
+Intermittent — it passed on the next two runs and on the unmodified tree, so it is pre-existing and
+was not introduced by any recent change. But the underlying behaviour is not a flake.
+
+Two transactions touching the same record (here, one history branch's index while another forks it)
+make one of them block. Aerospike documents this as **retryable**, and `convertError` correctly maps
+it to `Unavailable`. What the store does not do is retry: it hands the error to the caller, and
+Temporal's own retryable client does not always absorb it.
+
+The fix is a bounded retry with backoff around a transaction that fails with `MRT_BLOCKED`,
+`MRT_VERSION_MISMATCH` or `TXN_FAILED`. That is more than a wrapper, because these transactions are
+built imperatively — begin, operate, commit — so retrying means re-running the whole unit of work,
+which in turn means each one has to be expressed as something re-runnable.
+
+Worth doing before any load testing: contention is rare on an idle demo and routine under
+throughput, so this is likely to show up as unexplained failures in Iteration 2 rather than as
+something obviously wrong now.
+
+---
+
 ## Resolved
 
 ### R22 — The backend switch works, verified on a real cluster

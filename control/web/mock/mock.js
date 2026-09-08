@@ -361,7 +361,8 @@ async function mockFetch(input, init = {}) {
 
   if (path === '/api/workflow/run' && method === 'POST') {
     if (world.switching) return json({ error: 'switch in progress' }, 503);
-    await sleep(500 + Math.random() * 700);
+    // The real workflow sleeps 10s on a durable timer; compressed here.
+    await sleep(1400 + Math.random() * 400);
     world.runSeq++;
     const store = world.backend;
     if (store === 'aerospike') world.runs++;
@@ -370,7 +371,7 @@ async function mockFetch(input, init = {}) {
       runId: `${digest(world.runSeq).slice(0, 8)}-4b2f-4c11-9a7e-${digest(world.runSeq * 3).slice(0, 12)}`,
       // The activity itself names the store it ran on.
       result: `Hello world, from ${store === 'aerospike' ? 'Aerospike' : 'SQLite'}`,
-      durationMs: 420 + Math.floor(Math.random() * 380),
+      durationMs: 10040 + Math.floor(Math.random() * 260),
       persistenceStore: store,
     });
   }
@@ -380,9 +381,9 @@ async function mockFetch(input, init = {}) {
     let count = 100;
     try { count = JSON.parse(init.body || '{}').count || 100; } catch { /* default */ }
 
-    // 10 at a time on the server, so roughly count/10 rounds. Compressed here
-    // so the harness stays usable.
-    await sleep(1200 + Math.random() * 600);
+    // 50 at a time on the server, and each workflow sleeps 10s, so 100 runs is
+    // two rounds of ~10s. Compressed here so the harness stays usable.
+    await sleep(1600 + Math.random() * 700);
     world.runSeq += count;
     const store = world.backend;
     if (store === 'aerospike') world.runs += count;
@@ -390,9 +391,9 @@ async function mockFetch(input, init = {}) {
       requested: count,
       completed: count,
       failed: 0,
-      durationMs: 1800 + Math.floor(Math.random() * 900),
-      fastestMs: 38 + Math.floor(Math.random() * 20),
-      slowestMs: 380 + Math.floor(Math.random() * 200),
+      durationMs: (count > 50 ? 21000 : 10500) + Math.floor(Math.random() * 900),
+      fastestMs: 10030 + Math.floor(Math.random() * 40),
+      slowestMs: 10400 + Math.floor(Math.random() * 600),
       persistenceStore: store,
     });
   }
