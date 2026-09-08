@@ -66,6 +66,121 @@ type RunResult struct {
 	PersistenceStore string `json:"persistenceStore"`
 }
 
+// BatchResult summarises a bulk run.
+//
+// Deliberately a summary and not 100 RunResults: the point of the bulk button
+// is to put enough tasks into the store that the bucket view has something to
+// show, not to list a hundred identical greetings.
+type BatchResult struct {
+	Requested        int    `json:"requested"`
+	Completed        int    `json:"completed"`
+	Failed           int    `json:"failed"`
+	DurationMs       int64  `json:"durationMs"`
+	FastestMs        int64  `json:"fastestMs"`
+	SlowestMs        int64  `json:"slowestMs"`
+	PersistenceStore string `json:"persistenceStore"`
+	// FirstError is the first failure encountered, if any. One example is more
+	// useful than a count on its own and cheaper than carrying all of them.
+	FirstError string `json:"firstError,omitempty"`
+}
+
+// batchConcurrency caps how many demo workflows are in flight at once.
+//
+// Not 100. The demo box is 4 vCPU, and Q7 in docs/04-open-questions.md records
+// an unexplained stall that reproduces specifically under CPU contention --
+// firing a hundred concurrent starts is the most reliable way to manufacture
+// exactly that condition in front of an audience. Ten keeps the box busy enough
+// to be interesting and finishes 100 runs in a couple of seconds.
+const batchConcurrency = 10
+
+// RunBatch executes count demo workflows, at most batchConcurrency at a time.
+//
+// onProgress is called as runs land so the caller can stream progress; it may
+// be nil, and it is called from multiple goroutines under the runner's own
+// lock-free path, so it must be safe to call concurrently.
+func (r *WorkflowRunner) RunBatch(ctx context.Context, count int, onProgress func(done, failed int)) (*BatchResult, error) {
+	if count <= 0 {
+		return nil, fmt.Errorf("batch size must be positive, got %d", count)
+	}
+
+	// One client for the whole batch. Taking it once also means a switch that
+	// tears the worker down mid-batch fails the remaining runs cleanly rather
+	// than resurrecting a client that points at replaced pods.
+	if _, err := r.clientForRun(ctx); err != nil {
+		return nil, err
+	}
+
+	var (
+		mu       sync.Mutex
+		done     int
+		failed   int
+		fastest  int64 = -1
+		slowest  int64
+		store    string
+		firstErr string
+	)
+
+	started := time.Now()
+	sem := make(chan struct{}, batchConcurrency)
+	var wg sync.WaitGroup
+
+	for i := 0; i < count; i++ {
+		select {
+		case <-ctx.Done():
+			// Stop launching; already-running executions still finish below.
+			i = count
+			continue
+		case sem <- struct{}{}:
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			res, err := r.Run(ctx)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				failed++
+				if firstErr == "" {
+					firstErr = err.Error()
+				}
+			} else {
+				done++
+				if fastest < 0 || res.DurationMs < fastest {
+					fastest = res.DurationMs
+				}
+				if res.DurationMs > slowest {
+					slowest = res.DurationMs
+				}
+				if store == "" {
+					store = res.PersistenceStore
+				}
+			}
+			if onProgress != nil {
+				onProgress(done, failed)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if fastest < 0 {
+		fastest = 0
+	}
+	return &BatchResult{
+		Requested:        count,
+		Completed:        done,
+		Failed:           failed,
+		DurationMs:       time.Since(started).Milliseconds(),
+		FastestMs:        fastest,
+		SlowestMs:        slowest,
+		PersistenceStore: store,
+		FirstError:       firstErr,
+	}, nil
+}
+
 func NewWorkflowRunner(cfg Config, logger *slog.Logger) *WorkflowRunner {
 	return &WorkflowRunner{
 		address:   cfg.TemporalAddress,

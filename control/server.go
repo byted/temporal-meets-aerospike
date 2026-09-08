@@ -164,6 +164,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/switch", s.handleSwitch)
 	mux.HandleFunc("POST /api/reset", s.handleReset)
 	mux.HandleFunc("POST /api/workflow/run", s.handleRunWorkflow)
+	mux.HandleFunc("POST /api/workflow/run-batch", s.handleRunBatch)
 	mux.HandleFunc("GET /api/aerospike/health", s.handleAerospikeHealth)
 	mux.HandleFunc("GET /api/aerospike/sets", s.handleAerospikeSets)
 	mux.HandleFunc("GET /api/aerospike/records", s.handleAerospikeRecords)
@@ -444,6 +445,85 @@ func (s *Server) runReset(ctx context.Context) error {
 
 	report("reset complete: Temporal is on sqlite and Aerospike is empty")
 	return nil
+}
+
+// defaultBatchCount is what the UI's bulk button sends when it sends nothing.
+const defaultBatchCount = 100
+
+// maxBatchCount bounds what a caller can ask for. The endpoint is behind basic
+// auth on a 4 vCPU box; an unbounded count is a self-inflicted outage.
+const maxBatchCount = 1000
+
+func (s *Server) handleRunBatch(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	switching := s.switching
+	s.mu.Unlock()
+	if switching {
+		writeError(w, http.StatusConflict, errors.New("a backend switch or reset is in progress"))
+		return
+	}
+
+	count := defaultBatchCount
+	// An empty body is fine and means the default, so a decode failure is only
+	// an error when there was something to decode.
+	if r.ContentLength > 0 {
+		var body struct {
+			Count int `json:"count"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("decoding request: %w", err))
+			return
+		}
+		if body.Count > 0 {
+			count = body.Count
+		}
+	}
+	if count > maxBatchCount {
+		writeError(w, http.StatusBadRequest,
+			fmt.Errorf("batch of %d exceeds the maximum of %d", count, maxBatchCount))
+		return
+	}
+
+	s.events.publish(Event{
+		Type:    EventProgress,
+		Message: fmt.Sprintf("running %d workflows, %d at a time", count, batchConcurrency),
+		Ts:      time.Now(),
+	})
+
+	// Progress is throttled to every 10 completions: a hundred SSE frames in
+	// two seconds would bury the switch log the panel shares.
+	var lastReported int
+	var progressMu sync.Mutex
+	result, err := s.runner.RunBatch(r.Context(), count, func(done, failed int) {
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		if done+failed-lastReported < 10 {
+			return
+		}
+		lastReported = done + failed
+		s.events.publish(Event{
+			Type:    EventProgress,
+			Message: fmt.Sprintf("%d/%d complete", done+failed, count),
+			Ts:      time.Now(),
+		})
+	})
+	if err != nil {
+		s.events.publish(Event{Type: EventError, Message: err.Error(), Ts: time.Now()})
+		status := http.StatusInternalServerError
+		if errors.Is(err, ErrWorkerNotRunning) {
+			status = http.StatusServiceUnavailable
+		}
+		writeError(w, status, err)
+		return
+	}
+
+	s.events.publish(Event{
+		Type: EventProgress,
+		Message: fmt.Sprintf("%d/%d workflows completed in %dms (fastest %dms, slowest %dms)",
+			result.Completed, result.Requested, result.DurationMs, result.FastestMs, result.SlowestMs),
+		Ts: time.Now(),
+	})
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleRunWorkflow(w http.ResponseWriter, r *http.Request) {

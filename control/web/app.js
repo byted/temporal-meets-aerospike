@@ -31,6 +31,10 @@ if (MOCK) {
 const POLL_MS          = 2000;   // state + aerospike refresh cadence
 const REQ_TIMEOUT_MS   = 8000;   // normal request budget
 const RUN_TIMEOUT_MS   = 120000; // a workflow run may legitimately take a while
+const BATCH_SIZE       = 100;
+// 100 runs at 10 concurrent is a couple of seconds normally, but the same
+// stall that affects a single run applies here, so allow generous headroom.
+const BATCH_TIMEOUT_MS = 300000;
 const SSE_RETRY_MS     = 2000;   // manual reconnect delay once EventSource gives up
 const MAX_RUNS         = 12;
 const MAX_LOG          = 300;
@@ -51,6 +55,7 @@ const el = {
   stepper:       $('stepper'),
 
   btnRun:        $('btn-run'),
+  btnRunBatch:   $('btn-run-batch'),
   hintRun:       $('hint-run'),
   runsBody:      $('runs-body'),
   runsEmpty:     $('runs-empty'),
@@ -97,6 +102,7 @@ const state = {
   expectDown:    false,     // downtime is expected -> not an error
   running:       false,     // a workflow run is in flight
   switchPending: false,     // the POST /api/switch itself is in flight
+  batchRunning:  false,     // a bulk run is in flight
   resetPending:  false,     // the POST /api/reset itself is in flight
   confirmReset:  false,     // the destructive-action confirmation is showing
 
@@ -406,6 +412,45 @@ async function runWorkflow() {
   }
 }
 
+// A batch adds ONE summary row, not a hundred. The run table exists to make the
+// store-per-run contrast readable; a hundred identical greetings would bury it.
+async function runBatch() {
+  if (state.running || state.batchRunning || isSwitching() || !state.serverUp) return;
+  state.batchRunning = true;
+  render();
+  log('local', `Starting ${BATCH_SIZE} workflows…`);
+
+  const t0 = performance.now();
+  try {
+    const r = await api('/api/workflow/run-batch', {
+      method: 'POST',
+      body: JSON.stringify({ count: BATCH_SIZE }),
+      timeout: BATCH_TIMEOUT_MS,
+    });
+    const store = r?.persistenceStore || state.backend || 'unknown';
+    const failed = r?.failed ?? 0;
+    pushRun({
+      ok:         failed === 0,
+      store,
+      batch:      true,
+      workflowId: `${r?.completed ?? 0}/${r?.requested ?? BATCH_SIZE} workflows`,
+      runId:      '',
+      result:     failed === 0
+        ? `all completed · fastest ${r?.fastestMs ?? '?'}ms, slowest ${r?.slowestMs ?? '?'}ms`
+        : `${failed} failed · ${r?.firstError ?? ''}`,
+      durationMs: typeof r?.durationMs === 'number' ? r.durationMs : Math.round(performance.now() - t0),
+    });
+    log(failed === 0 ? 'progress' : 'error',
+        `${r?.completed ?? 0}/${r?.requested ?? BATCH_SIZE} workflows completed on ${backendLabel(store)} in ${r?.durationMs ?? '?'}ms`);
+  } catch (err) {
+    log('error', `Batch failed: ${err.message || err}`);
+  } finally {
+    state.batchRunning = false;
+    render();
+    scheduleTick(150);
+  }
+}
+
 function pushRun(run) {
   state.runs.unshift({ ...run, at: new Date(), fresh: true });
   state.runs = state.runs.slice(0, MAX_RUNS);
@@ -553,8 +598,13 @@ function renderStepper() {
 function renderActions() {
   // Run workflow
   const runBlocked = isSwitching() || state.serverUp === false;
-  el.btnRun.disabled = runBlocked || state.running;
+  el.btnRun.disabled = runBlocked || state.running || state.batchRunning;
   el.btnRun.dataset.busy = String(state.running);
+
+  el.btnRunBatch.disabled = runBlocked || state.running || state.batchRunning;
+  el.btnRunBatch.dataset.busy = String(state.batchRunning);
+  el.btnRunBatch.querySelector('.btn-label').textContent =
+    state.batchRunning ? `Running ${BATCH_SIZE}…` : `Run ${BATCH_SIZE}`;
   el.btnRun.querySelector('.btn-label').textContent =
     state.running ? 'Running…' : 'Run workflow';
 
@@ -953,6 +1003,7 @@ function emptyLine(text) {
 /* ── wiring ────────────────────────────────────────────────────────────── */
 
 el.btnRun.addEventListener('click', runWorkflow);
+el.btnRunBatch.addEventListener('click', runBatch);
 el.btnSwitch.addEventListener('click', startSwitch);
 el.btnReset.addEventListener('click', askReset);
 el.btnResetCancel.addEventListener('click', cancelReset);

@@ -375,6 +375,28 @@ async function mockFetch(input, init = {}) {
     });
   }
 
+  if (path === '/api/workflow/run-batch' && method === 'POST') {
+    if (world.switching) return json({ error: 'switch in progress' }, 503);
+    let count = 100;
+    try { count = JSON.parse(init.body || '{}').count || 100; } catch { /* default */ }
+
+    // 10 at a time on the server, so roughly count/10 rounds. Compressed here
+    // so the harness stays usable.
+    await sleep(1200 + Math.random() * 600);
+    world.runSeq += count;
+    const store = world.backend;
+    if (store === 'aerospike') world.runs += count;
+    return json({
+      requested: count,
+      completed: count,
+      failed: 0,
+      durationMs: 1800 + Math.floor(Math.random() * 900),
+      fastestMs: 38 + Math.floor(Math.random() * 20),
+      slowestMs: 380 + Math.floor(Math.random() * 200),
+      persistenceStore: store,
+    });
+  }
+
   if (path === '/api/aerospike/health') {
     const live = world.backend === 'aerospike' || world.switching;
     return json({
