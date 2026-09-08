@@ -47,6 +47,10 @@ const ENTRY_CAP                = 6;          // what the API returns per bucket
    clock that visibly crawls under the viewer. */
 const MINUTE0 = Math.floor(Date.now() / 60000) - 2;
 
+/* The bucket a workflow's history-cleanup timer lands in: one namespace
+   retention period (24h) after the workflow completes. */
+const RETENTION_MINUTE = MINUTE0 + 24 * 60;
+
 /* ── the bucket layout ─────────────────────────────────────────────────── */
 
 /* Entries in an immediate bucket: map key is the int64 task id itself. */
@@ -143,6 +147,16 @@ function historyTasks() {
       (() => {
         const e = scheduledEntries(MINUTE0 + 1, [[12, 4194329], [12, 4194330], [44, 4194411]]);
         return bucketOf(3, 2, MINUTE0 + 1, e.length, e);
+      })(),
+      // A retention-cleanup bucket, a full day out. Not every timer in these
+      // queues fires within the demo: completing a workflow schedules deletion
+      // of its history at the namespace retention horizon, which is 24h here.
+      // It lives in the mock because it is the case that reads as broken when
+      // fire times are rendered without a date -- tomorrow 19:40 and an overdue
+      // 19:40 are the same six characters. Keep it.
+      (() => {
+        const e = scheduledEntries(RETENTION_MINUTE, [[8, 4201377], [8, 4201378], [23, 4201402]]);
+        return bucketOf(3, 2, RETENTION_MINUTE, e.length, e);
       })(),
     ],
   };

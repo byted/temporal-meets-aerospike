@@ -164,6 +164,36 @@ something obviously wrong now.
 
 ## Resolved
 
+### R23 — "Overdue" timer buckets were a missing date, not a stuck queue
+
+The demo UI rendered scheduled-task fire times as bare wall-clock time, on the
+assumption recorded in `control/web/app.js` that "every timer in the demo fires
+within minutes". That assumption is false, and the exception is the common case:
+when a workflow completes, Temporal schedules deletion of its history at the
+namespace retention horizon — 24 hours here. A 100-run batch therefore leaves
+100 timer tasks a full day out.
+
+Rendered without a date, a bucket firing *tomorrow* at 19:40 is character for
+character identical to one that fired *today* at 19:40 and is now ten minutes
+overdue. A screen of healthy retention timers read as a queue that had stopped
+draining.
+
+Measured before the diagnosis, to rule out the real failure: fired user timers
+drain to zero within 40–60s of firing (10-workflow batch, sampled at 20s
+intervals), and a snapshot of 102 scheduled entries contained **zero** with a
+fire time in the past. Nothing was stuck. The remaining entries were 101
+retention timers at +24h and one `temporal-sys-history-scanner-workflow` timer
+at +9h — a Temporal system workflow on its own cadence, unrelated to the store.
+
+Fixed by attaching the date whenever a fire time is not today, plus a coarse
+relative marker (`in 1d`, `12m ago`) so past-vs-future is answerable at a glance.
+`control/web/mock/mock.js` now carries a retention bucket a day out so the case
+is exercised offline rather than only discovered on a live demo.
+
+The lesson is about observability rather than persistence: a view that omits a
+field because "it is always the same here" turns a normal state into an apparent
+incident the moment that stops being true.
+
 ### R22 — The backend switch works, verified on a real cluster
 
 *Resolved 2026-09-07, demo.*

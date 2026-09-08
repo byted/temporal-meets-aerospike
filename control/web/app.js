@@ -167,17 +167,47 @@ function rfc3339Nanos(s) {
   return BigInt(secs) * 1000000000n + BigInt(digits);
 }
 
-/* Wall-clock part of a timestamp. Dates are almost never useful here — every
-   timer in the demo fires within minutes — so the time is what gets shown. */
-function fmtClock(s, { ms = true } = {}) {
+/* Local calendar day, for deciding whether a timestamp needs its date spelled
+   out. Local, not UTC: everything on this page is rendered in the viewer's zone,
+   so "today" has to mean their today. */
+const dayKey = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+
+/* Wall-clock part of a timestamp, with the date attached unless it is today.
+ *
+ * The date is not decoration. Not every task in these queues is a user timer
+ * firing seconds from now: when a workflow completes, Temporal schedules its
+ * history cleanup at the namespace retention horizon, which here is 24 hours
+ * out. Rendered as bare time, a bucket firing tomorrow at 19:40 is character
+ * for character identical to one that fired today at 19:40 and is now badly
+ * overdue -- so a screen full of perfectly healthy retention timers reads as a
+ * queue that has stopped draining. Showing the date costs a few characters and
+ * removes the ambiguity entirely.
+ */
+function fmtClock(s, { ms = true, date = true } = {}) {
   const d = new Date(s);
   if (isNaN(d)) return String(s ?? '—');
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
-  return ms
+  const clock = ms
     ? `${hh}:${mm}:${ss}.${String(d.getMilliseconds()).padStart(3, '0')}`
     : `${hh}:${mm}:${ss}`;
+  if (!date || dayKey(d) === dayKey(new Date())) return clock;
+  return `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${clock}`;
+}
+
+/* Coarse distance from now, signed. Answers the question the date alone only
+   implies -- has this fired yet? One significant unit is enough; nobody needs
+   "in 23h 58m" to understand that a bucket is not overdue. */
+function fmtRel(d) {
+  const secs = Math.round((d.getTime() - Date.now()) / 1000);
+  const a = Math.abs(secs);
+  let n, u;
+  if (a < 60)         { n = a;                  u = 's'; }
+  else if (a < 3600)  { n = Math.round(a / 60);    u = 'm'; }
+  else if (a < 86400) { n = Math.round(a / 3600);  u = 'h'; }
+  else                { n = Math.round(a / 86400); u = 'd'; }
+  return secs >= 0 ? `in ${n}${u}` : `${n}${u} ago`;
 }
 
 const hex64 = (v) => v.toString(16).padStart(16, '0');
@@ -900,7 +930,12 @@ function boundaryText(cat, b, bucketing) {
     if (!isFinite(secs) || secs <= 0) return '';
     const from = new Date(n * secs * 1000);
     const to   = new Date((n + 1) * secs * 1000);
-    return `fires ${fmtClock(from, { ms: false })} → ${fmtClock(to, { ms: false })}`;
+    // Date on the lower bound only -- a bucket spans one interval, so both ends
+    // are the same day and repeating it would just be noise. The relative
+    // suffix is what makes an overdue bucket distinguishable at a glance from
+    // one that simply fires tomorrow.
+    return `fires ${fmtClock(from, { ms: false })} → ${fmtClock(to, { ms: false, date: false })}` +
+           ` · ${fmtRel(from)}`;
   }
 
   const shift = Number(bucketing.immediateShift);
