@@ -20,6 +20,37 @@ metadata:
     app.kubernetes.io/name: temporal
     app.kubernetes.io/part-of: temporal-meets-aerospike
 data:
+  # Dynamic config, shared by both backends.
+  #
+  # This file exists for one setting, and that setting is not an optimisation --
+  # it fixes a race that made the first workflow after a switch stall for up to
+  # a minute.
+  #
+  # Without it, a task queue gets GlobalDefaultNumTaskQueuePartitions = 4 read
+  # and 4 write partitions. History picks a write partition at random
+  # (client/matching/loadbalancer.go: rand.Intn(n)), while a single worker's
+  # single poller is pinned to one read partition for the duration of its long
+  # poll. So ~75% of tasks land on a partition nobody is polling.
+  #
+  # Normally harmless: the child partition forwards to the root in milliseconds.
+  # But right after a restart, during matching's cold-start window, that
+  # forwarding is not yet available -- and the task then waits for the poller's
+  # next poll cycle, which is matching.longPollExpirationInterval = 1 minute.
+  #
+  # That is why the stall was intermittent and never the same length: measured
+  # at 43.1s, 52.2s, 53.1s, 58.6s and once past 60s, uniformly distributed
+  # inside the poll window rather than clustered like a genuine cold start.
+  # It reproduced 3 times in 4 switches under CPU load, and 0 times in ~17
+  # switches on an idle box.
+  #
+  # One partition means the write always lands where the poller is. This is what
+  # `temporal server start-dev` does, and 4 partitions buy a single-worker demo
+  # nothing.
+  dynamicconfig.yaml: |
+    matching.numTaskqueueReadPartitions:
+      - value: 1
+    matching.numTaskqueueWritePartitions:
+      - value: 1
   # TEMPORAL_ENVIRONMENT=sqlite
   sqlite.yaml: |
     # Stock Temporal: SQLite for both the operational store and visibility.
@@ -124,6 +155,12 @@ data:
 
     dcRedirectionPolicy:
       policy: "noop"
+
+    # See the dynamicconfig.yaml comment above: one task queue partition, so a
+    # single poller is always on the partition history writes to.
+    dynamicConfigClient:
+      filepath: "/etc/temporal/config/dynamicconfig.yaml"
+      pollInterval: "60s"
 
   # TEMPORAL_ENVIRONMENT=aerospike
   aerospike.yaml: |
@@ -232,3 +269,9 @@ data:
 
     dcRedirectionPolicy:
       policy: "noop"
+
+    # See the dynamicconfig.yaml comment above: one task queue partition, so a
+    # single poller is always on the partition history writes to.
+    dynamicConfigClient:
+      filepath: "/etc/temporal/config/dynamicconfig.yaml"
+      pollInterval: "60s"

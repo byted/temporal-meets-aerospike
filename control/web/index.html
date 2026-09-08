@@ -29,7 +29,7 @@
   <li data-step="2"><span class="step-n">2</span><span class="step-t">Run a workflow</span></li>
   <li data-step="3"><span class="step-n">3</span><span class="step-t">Switch to Aerospike</span></li>
   <li data-step="4"><span class="step-n">4</span><span class="step-t">Run it again</span></li>
-  <li data-step="5"><span class="step-n">5</span><span class="step-t">Inspect the data</span></li>
+  <li data-step="5"><span class="step-n">5</span><span class="step-t">Inspect the task queues</span></li>
 </ol>
 
 <main>
@@ -90,6 +90,18 @@
             <tbody id="runs-body"></tbody>
           </table>
           <p class="empty" id="runs-empty">No runs yet. Press <strong>Run workflow</strong>.</p>
+          <p class="runs-note">The store tag is what the control plane reported for that run, and the
+            result text is produced by the activity itself — the workflow names the store it ran on.</p>
+        </div>
+
+        <div class="external">
+          <a class="btn ghost external-link" id="link-temporal" href="/temporal" target="_blank" rel="noopener">
+            <span class="btn-label">Open Temporal Web UI</span>
+            <span class="ext-glyph" aria-hidden="true">↗</span>
+          </a>
+          <p class="action-hint">Temporal's own web UI, served at <code>/temporal</code> on this host behind
+            the same login. Opens in a new tab: real workflow histories for the runs above, event by
+            event, read from whichever store is active right now.</p>
         </div>
       </div>
     </section>
@@ -115,16 +127,41 @@
           </div>
           <ol class="log" id="log" aria-live="polite"></ol>
         </div>
+
+        <div class="recovery">
+          <div class="recovery-row">
+            <button class="btn subtle-danger" id="btn-reset" type="button">
+              <span class="btn-label">Reset demo</span>
+              <span class="spinner" aria-hidden="true"></span>
+            </button>
+            <p class="action-hint" id="hint-reset"></p>
+          </div>
+
+          <div class="confirm" id="reset-confirm" hidden role="alertdialog" aria-labelledby="reset-confirm-q">
+            <p class="confirm-q" id="reset-confirm-q">
+              <strong>Wipe every Aerospike record and switch back to SQLite?</strong>
+              All workflow history in Aerospike is deleted and the demo returns to step 1.
+              This cannot be undone.
+            </p>
+            <div class="confirm-actions">
+              <button class="btn tiny ghost" id="btn-reset-cancel" type="button">Cancel</button>
+              <button class="btn tiny danger" id="btn-reset-go" type="button">Yes, wipe and reset</button>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
 
   </div>
 
-  <!-- ── Aerospike ───────────────────────────────────────────────────── -->
-  <section class="panel wide" id="panel-aerospike">
+  <!-- ── The centrepiece: ordered task queues on bucketed records ─────── -->
+  <section class="panel wide" id="panel-htask">
     <header class="panel-head">
-      <h2>Aerospike namespace</h2>
-      <p>What Temporal's data actually looks like once it lands in Aerospike.</p>
+      <h2>Ordered task queues, emulated by bucketing</h2>
+      <p>Cassandra hands Temporal one clustered partition per shard and answers
+        “tasks in <code>[min, max)</code>, ascending” with a single range scan. Aerospike has no
+        clustering key and no ordered scan — so the clustering key becomes a <em>map key</em>, and
+        the partition becomes a <em>run of bucketed records</em>.</p>
     </header>
 
     <div class="panel-body">
@@ -154,21 +191,29 @@
 
       <p class="notice" id="as-notice" hidden></p>
 
-      <h3 class="sub">Sets <span class="sub-note">— each one is a piece of Temporal's model</span></h3>
-      <div class="sets" id="sets"></div>
-      <p class="empty" id="sets-empty" hidden>No sets yet. Aerospike creates them on first write.</p>
-
-      <div class="records" id="records" hidden>
-        <div class="records-head">
-          <h3 class="sub">Records in <code id="records-set">—</code></h3>
-          <div class="records-actions">
-            <span class="records-count" id="records-count"></span>
-            <button class="btn tiny ghost" id="btn-close-records" type="button">close</button>
-          </div>
+      <!-- anatomy of one record key -->
+      <div class="anatomy">
+        <div class="anatomy-key" aria-label="Record key: set htask, shard 3, category 2, bucket 0">
+          <span class="ak-set">htask</span>
+          <span class="ak-sep">/</span>
+          <span class="ak-seg" data-seg="shard"><b>3</b><i>shard</i></span>
+          <span class="ak-sep">:</span>
+          <span class="ak-seg" data-seg="cat"><b>2</b><i>category</i></span>
+          <span class="ak-sep">:</span>
+          <span class="ak-seg" data-seg="bucket"><b>0</b><i>bucket</i></span>
         </div>
-        <p class="records-desc" id="records-desc"></p>
-        <div id="records-list"></div>
+        <p class="anatomy-note">
+          <strong>One Aerospike record per bucket.</strong> Every bucket holds a K-ordered map in bin
+          <code>t</code>, and the <em>server</em> returns that map's entries in key order. Bucket numbers
+          are monotonic in the sort key, so a range read walks the buckets in order and gets a globally
+          ordered stream out the far end. That is the whole trick.
+        </p>
       </div>
+
+      <div class="rules" id="rules"></div>
+
+      <div class="htask" id="htask"></div>
+      <p class="empty" id="htask-empty" hidden></p>
 
     </div>
   </section>

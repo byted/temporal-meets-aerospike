@@ -4,6 +4,15 @@
  * Vanilla ES module. No build step, no dependencies. Served by the Go control
  * service from a go:embed FS at "/".
  *
+ * The page has one idea to teach: Temporal's ordered task queues are emulated
+ * on Aerospike by bucketing. Everything under "Ordered task queues" exists to
+ * make that mechanism visible — the record key, the bucket boundaries, and the
+ * server-side ordering inside each bucket.
+ *
+ * Ordering note: the API returns shards, categories, buckets and entries
+ * already in order. Nothing here re-sorts, and nothing iterates an object's
+ * keys where an array was given — the ordering IS the lesson.
+ *
  * Offline preview:  index.html?mock=1   (see ./mock/mock.js)
  * ========================================================================== */
 
@@ -25,7 +34,6 @@ const RUN_TIMEOUT_MS   = 120000; // a workflow run may legitimately take a while
 const SSE_RETRY_MS     = 2000;   // manual reconnect delay once EventSource gives up
 const MAX_RUNS         = 12;
 const MAX_LOG          = 300;
-const RECORD_LIMIT     = 25;
 
 /* ── dom ───────────────────────────────────────────────────────────────── */
 
@@ -52,6 +60,12 @@ const el = {
   log:           $('log'),
   btnClearLog:   $('btn-clear-log'),
 
+  btnReset:      $('btn-reset'),
+  hintReset:     $('hint-reset'),
+  resetConfirm:  $('reset-confirm'),
+  btnResetGo:    $('btn-reset-go'),
+  btnResetCancel:$('btn-reset-cancel'),
+
   statReach:     $('stat-reach'),
   statSc:        $('stat-sc'),
   statDead:      $('stat-dead'),
@@ -59,15 +73,9 @@ const el = {
   statObjects:   $('stat-objects'),
   asNotice:      $('as-notice'),
 
-  sets:          $('sets'),
-  setsEmpty:     $('sets-empty'),
-
-  records:       $('records'),
-  recordsSet:    $('records-set'),
-  recordsDesc:   $('records-desc'),
-  recordsCount:  $('records-count'),
-  recordsList:   $('records-list'),
-  btnCloseRecs:  $('btn-close-records'),
+  rules:         $('rules'),
+  htask:         $('htask'),
+  htaskEmpty:    $('htask-empty'),
 
   footMode:      $('foot-mode'),
 };
@@ -80,31 +88,32 @@ const state = {
   temporalReady: false,
   switching:     false,     // server-reported
   namespace:     null,
+  stateError:    null,
 
   // local
   serverUp:      null,      // null = never talked to it yet
   localSwitch:   false,     // we asked for a switch; server may not report it yet
+  localReset:    false,     // we asked for a reset; same
   expectDown:    false,     // downtime is expected -> not an error
   running:       false,     // a workflow run is in flight
   switchPending: false,     // the POST /api/switch itself is in flight
+  resetPending:  false,     // the POST /api/reset itself is in flight
+  confirmReset:  false,     // the destructive-action confirmation is showing
 
   // aerospike
   health:        null,
   healthErr:     null,
-  sets:          [],
-  setsErr:       null,
-
-  selectedSet:   null,
-  records:       null,      // null = not loaded yet, [] = genuinely empty
-  recordsErr:    null,
-  recordsBusy:   false,
+  htask:         null,      // the /api/aerospike/history-tasks payload
+  htaskErr:      null,
 
   runs:          [],
   streamStatus:  'connecting',
 };
 
-const isSwitching = () => state.switching || state.localSwitch;
+const isSwitching = () => state.switching || state.localSwitch || state.localReset;
 const onAerospike = () => state.backend === 'aerospike';
+const busyTransition = () =>
+  isSwitching() || state.switchPending || state.resetPending;
 
 /* ── tiny helpers ──────────────────────────────────────────────────────── */
 
@@ -114,7 +123,8 @@ function esc(s) {
   ));
 }
 
-const nfmt = (n) => (typeof n === 'number' && isFinite(n) ? n.toLocaleString() : '—');
+const nfmt = (n) =>
+  (typeof n === 'number' && isFinite(n) ? n.toLocaleString('en-US') : '—');
 
 function fmtBytes(n) {
   if (typeof n !== 'number' || !isFinite(n) || n < 0) return '';
@@ -134,9 +144,42 @@ const shortId = (s, n = 22) =>
 const backendLabel = (b) =>
   b === 'aerospike' ? 'Aerospike' : b === 'sqlite' ? 'SQLite' : 'unknown';
 
-/* Bins holding serialized protos are opaque — never pretend they are text. */
-const OPAQUE_RE = /blob|byte|proto|binary/i;
-const isOpaque = (type) => OPAQUE_RE.test(String(type ?? ''));
+/* ── time / key encoding helpers ───────────────────────────────────────── */
+
+/* RFC3339 -> nanoseconds since epoch, as BigInt. Date.parse only carries
+   milliseconds, so any digits past the third are picked out of the string. */
+function rfc3339Nanos(s) {
+  const ms = Date.parse(s);
+  if (!isFinite(ms)) return null;
+  const frac = /\.(\d+)/.exec(String(s));
+  const digits = frac ? frac[1].padEnd(9, '0').slice(0, 9) : '000000000';
+  const secs = Math.floor(ms / 1000);
+  return BigInt(secs) * 1000000000n + BigInt(digits);
+}
+
+/* Wall-clock part of a timestamp. Dates are almost never useful here — every
+   timer in the demo fires within minutes — so the time is what gets shown. */
+function fmtClock(s, { ms = true } = {}) {
+  const d = new Date(s);
+  if (isNaN(d)) return String(s ?? '—');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return ms
+    ? `${hh}:${mm}:${ss}.${String(d.getMilliseconds()).padStart(3, '0')}`
+    : `${hh}:${mm}:${ss}`;
+}
+
+const hex64 = (v) => v.toString(16).padStart(16, '0');
+
+/* The exact bytes the store writes as the map key for a scheduled task:
+   bigendian(fireTimeNanos) || bigendian(taskID). Reproduced here so the
+   16-byte blob is a thing you can look at, not a thing you are told about. */
+function scheduledKeyHex(fireTime, taskId) {
+  const nanos = rfc3339Nanos(fireTime);
+  if (nanos === null || typeof taskId !== 'number') return null;
+  return { fire: hex64(nanos), id: hex64(BigInt(Math.trunc(taskId))) };
+}
 
 /* ── api ───────────────────────────────────────────────────────────────── */
 
@@ -290,6 +333,13 @@ async function refreshState() {
       state.expectDown  = false;
       log('state', 'Switch complete — Temporal is serving from Aerospike.');
     }
+    // Same for the reset, which lands the other way round.
+    if (state.localReset && state.backend === 'sqlite' && !state.switching) {
+      state.localReset = false;
+      state.expectDown = false;
+      state.runs = [];
+      log('state', 'Reset complete — Aerospike is empty and Temporal is back on SQLite.');
+    }
     if (!isSwitching()) state.expectDown = false;
   } catch (err) {
     // During a switch the server restarts, so refused connections are expected.
@@ -304,42 +354,16 @@ async function refreshState() {
 }
 
 async function refreshAerospike() {
-  const [h, s] = await Promise.allSettled([
-    api('/api/aerospike/health', { timeout: 4000 }),
-    api('/api/aerospike/sets',   { timeout: 4000 }),
+  const [h, t] = await Promise.allSettled([
+    api('/api/aerospike/health',        { timeout: 4000 }),
+    api('/api/aerospike/history-tasks', { timeout: 6000 }),
   ]);
 
   if (h.status === 'fulfilled') { state.health = h.value; state.healthErr = null; }
   else { state.health = null; state.healthErr = h.reason?.message || String(h.reason); }
 
-  if (s.status === 'fulfilled') {
-    state.sets = Array.isArray(s.value) ? s.value : [];
-    state.setsErr = null;
-  } else {
-    state.sets = [];
-    state.setsErr = s.reason?.message || String(s.reason);
-  }
-
-  if (state.selectedSet) await refreshRecords(state.selectedSet, { quiet: true });
-}
-
-async function refreshRecords(name, { quiet = false } = {}) {
-  if (!quiet) { state.recordsBusy = true; state.recordsErr = null; render(); }
-  try {
-    const r = await api(
-      `/api/aerospike/records?set=${encodeURIComponent(name)}&limit=${RECORD_LIMIT}`,
-      { timeout: 6000 },
-    );
-    if (state.selectedSet !== name) return; // selection moved on while we waited
-    state.records    = Array.isArray(r) ? r : [];
-    state.recordsErr = null;
-  } catch (err) {
-    if (state.selectedSet !== name) return;
-    if (!quiet) { state.records = null; state.recordsErr = err.message || String(err); }
-  } finally {
-    state.recordsBusy = false;
-    if (!quiet) render();
-  }
+  if (t.status === 'fulfilled') { state.htask = t.value || null; state.htaskErr = null; }
+  else { state.htask = null; state.htaskErr = t.reason?.message || String(t.reason); }
 }
 
 /* ── actions ───────────────────────────────────────────────────────────── */
@@ -353,17 +377,22 @@ async function runWorkflow() {
   const t0 = performance.now();
   try {
     const r = await api('/api/workflow/run', { method: 'POST', timeout: RUN_TIMEOUT_MS });
+    // The server tells us which store the run actually executed against. Trust
+    // that over our polled view of the backend — it is authoritative for the run.
+    const store = r?.persistenceStore || state.backend || 'unknown';
     pushRun({
       ok:         true,
+      store,
       workflowId: r?.workflowId ?? '(no id)',
       runId:      r?.runId ?? '',
       result:     r?.result ?? '(no result)',
       durationMs: typeof r?.durationMs === 'number' ? r.durationMs : Math.round(performance.now() - t0),
     });
-    log('progress', `Workflow completed on ${backendLabel(state.backend)}: ${r?.result ?? ''}`);
+    log('progress', `Workflow completed on ${backendLabel(store)}: ${r?.result ?? ''}`);
   } catch (err) {
     pushRun({
       ok:         false,
+      store:      state.backend || 'unknown',
       workflowId: '—',
       runId:      '',
       result:     err.message || String(err),
@@ -373,21 +402,22 @@ async function runWorkflow() {
   } finally {
     state.running = false;
     render();
-    scheduleTick(150); // let the object counts move straight away
+    scheduleTick(150); // let the bucket view move straight away
   }
 }
 
 function pushRun(run) {
-  state.runs.unshift({ ...run, backend: state.backend || 'unknown', at: new Date(), fresh: true });
+  state.runs.unshift({ ...run, at: new Date(), fresh: true });
   state.runs = state.runs.slice(0, MAX_RUNS);
 }
 
 async function startSwitch() {
-  if (isSwitching() || onAerospike() || state.switchPending) return;
+  if (busyTransition() || onAerospike()) return;
 
   state.switchPending = true;
   state.localSwitch   = true;
   state.expectDown    = true;
+  state.confirmReset  = false;
   render();
   log('local', 'Requested switch to Aerospike. The stack will reconfigure and Temporal will restart.');
 
@@ -408,21 +438,39 @@ async function startSwitch() {
   }
 }
 
-function selectSet(name) {
-  if (state.selectedSet === name) return closeRecords();
-  state.selectedSet = name;
-  state.records     = null;
-  state.recordsErr  = null;
-  refreshRecords(name);
+function askReset() {
+  if (busyTransition() || state.serverUp === false) return;
+  state.confirmReset = true;
   render();
-  el.records.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  el.btnResetCancel.focus();
 }
 
-function closeRecords() {
-  state.selectedSet = null;
-  state.records     = null;
-  state.recordsErr  = null;
+function cancelReset() {
+  state.confirmReset = false;
   render();
+}
+
+async function startReset() {
+  if (busyTransition()) return;
+
+  state.confirmReset  = false;
+  state.resetPending  = true;
+  state.localReset    = true;
+  state.expectDown    = true;
+  render();
+  log('local', 'Requested reset. Aerospike will be wiped and Temporal moved back to SQLite.');
+
+  try {
+    await api('/api/reset', { method: 'POST', timeout: 15000 });
+  } catch (err) {
+    state.localReset = false;
+    state.expectDown = false;
+    log('error', `Reset request failed: ${err.message || err}`);
+  } finally {
+    state.resetPending = false;
+    render();
+    scheduleTick(300);
+  }
 }
 
 /* ── render ────────────────────────────────────────────────────────────── */
@@ -433,8 +481,8 @@ function render() {
   renderActions();
   renderRuns();
   renderHealth();
-  renderSets();
-  renderRecords();
+  renderRules();
+  renderHtask();
 }
 
 function pill(node, tone, text) {
@@ -459,6 +507,7 @@ function renderHero() {
   el.tileSqlite.dataset.active    = String(b === 'sqlite');
   el.tileAerospike.dataset.active = String(b === 'aerospike');
   el.trackArrow.dataset.moving    = String(isSwitching());
+  el.trackArrow.dataset.reverse   = String(state.localReset);
 
   if (isSwitching()) {
     pill(el.pillReady, 'warn', 'Temporal: restarting');
@@ -487,9 +536,10 @@ function renderHero() {
 }
 
 function renderStepper() {
-  const runsOnAerospike = state.runs.filter((r) => r.backend === 'aerospike').length;
+  const runsOnAerospike = state.runs.filter((r) => r.store === 'aerospike').length;
   let now;
-  if (isSwitching())                        now = 3;
+  if (state.localReset)                     now = 1;
+  else if (isSwitching())                   now = 3;
   else if (!onAerospike())                  now = state.runs.length === 0 ? 2 : 3;
   else if (runsOnAerospike === 0)           now = 4;
   else                                      now = 5;
@@ -521,18 +571,38 @@ function renderActions() {
   // Switch
   const switchBusy = isSwitching() || state.switchPending;
   el.btnSwitch.disabled = switchBusy || onAerospike() || state.serverUp === false;
-  el.btnSwitch.dataset.busy = String(switchBusy);
+  el.btnSwitch.dataset.busy = String(switchBusy && !state.localReset);
   el.btnSwitch.querySelector('.btn-label').textContent =
     onAerospike() ? 'Running on Aerospike' : switchBusy ? 'Switching…' : 'Switch to Aerospike';
 
   if (onAerospike() && !switchBusy) {
     hint(el.hintSwitch, 'ok', 'Done. Temporal is persisting to Aerospike — run the workflow again.');
+  } else if (state.localReset) {
+    hint(el.hintSwitch, 'warn', 'Resetting back to SQLite.');
   } else if (switchBusy) {
     hint(el.hintSwitch, 'warn', 'Reconfiguring. This takes tens of seconds and the server restarts.');
   } else if (state.serverUp === false) {
     hint(el.hintSwitch, 'err', 'Control plane unreachable.');
   } else {
     hint(el.hintSwitch, '', 'Rewrites the persistence config, restarts Temporal, and reconnects.');
+  }
+
+  // Reset — recovery only, never part of the happy path.
+  const resetBusy = state.localReset || state.resetPending;
+  el.btnReset.disabled = busyTransition() || state.serverUp === false;
+  el.btnReset.dataset.busy = String(resetBusy);
+  el.btnReset.querySelector('.btn-label').textContent =
+    resetBusy ? 'Resetting…' : 'Reset demo';
+
+  el.resetConfirm.hidden = !state.confirmReset;
+  el.btnResetGo.disabled = busyTransition();
+
+  if (resetBusy) {
+    hint(el.hintReset, 'warn', 'Wiping Aerospike and restarting Temporal on SQLite.');
+  } else if (state.serverUp === false) {
+    hint(el.hintReset, 'err', 'Control plane unreachable.');
+  } else {
+    hint(el.hintReset, '', 'Destructive. Deletes every Aerospike record and puts the demo back at step 1.');
   }
 }
 
@@ -543,7 +613,7 @@ function hint(node, tone, text) {
 
 let runsSig = '';
 function renderRuns() {
-  const sig = state.runs.map((r) => `${r.at.getTime()}:${r.backend}:${r.ok}`).join('|');
+  const sig = state.runs.map((r) => `${r.at.getTime()}:${r.store}:${r.ok}`).join('|');
   el.runsEmpty.hidden = state.runs.length > 0;
   if (sig === runsSig) return;
   runsSig = sig;
@@ -553,7 +623,7 @@ function renderRuns() {
     const tr = document.createElement('tr');
     if (r.fresh) { tr.className = 'run-row-fresh'; r.fresh = false; }
     tr.innerHTML = `
-      <td class="c-store"><span class="store-tag" data-b="${esc(r.backend)}">${esc(backendLabel(r.backend))}</span></td>
+      <td class="c-store"><span class="store-tag" data-b="${esc(r.store)}">${esc(r.store)}</span></td>
       <td class="c-id"><span class="run-id" title="${esc(r.workflowId)}${r.runId ? ` · run ${esc(r.runId)}` : ''}">${esc(shortId(r.workflowId))}</span></td>
       <td class="c-dur">${esc(fmtDuration(r.durationMs))}</td>
       <td class="c-res"><span class="run-result" data-ok="${r.ok}">${esc(r.result)}</span></td>`;
@@ -586,7 +656,7 @@ function renderHealth() {
 
   let notice = '', tone = '';
   if (isSwitching()) {
-    notice = 'Reconfiguring. Sets appear as Temporal writes its first records.';
+    notice = 'Reconfiguring. Buckets appear as Temporal writes its first history tasks.';
     tone = 'warn';
   } else if (state.healthErr && state.serverUp) {
     notice = `Namespace health unavailable: ${state.healthErr}`;
@@ -603,79 +673,274 @@ function renderHealth() {
   if (tone) el.asNotice.dataset.tone = tone; else delete el.asNotice.dataset.tone;
 }
 
-let setsSig = '';
-function renderSets() {
-  const sets = state.sets;
-  const sig = JSON.stringify(sets) + '|' + state.selectedSet;
-  el.setsEmpty.hidden = sets.length > 0;
-  if (sets.length === 0) {
-    el.setsEmpty.textContent = state.setsErr
-      ? `Could not list sets: ${state.setsErr}`
-      : onAerospike()
-        ? 'No sets yet. Aerospike creates them implicitly on first write.'
-        : 'No sets yet — Temporal has not written to Aerospike.';
-  }
-  if (sig === setsSig) return;
-  setsSig = sig;
+/* ── bucketing rules ───────────────────────────────────────────────────── */
 
-  el.sets.textContent = '';
-  for (const s of sets) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.className = 'set-card';
-    b.dataset.selected = String(state.selectedSet === s.name);
-    b.dataset.set = s.name;
-    b.innerHTML = `
-      <span class="set-top">
-        <span class="set-name">${esc(s.name)}</span>
-        <span class="set-count">${esc(nfmt(s.objects))}<span class="unit">obj</span></span>
-      </span>
-      <span class="set-desc">${esc(s.description || 'No description supplied by the API.')}</span>`;
-    b.addEventListener('click', () => selectSet(s.name));
-    el.sets.appendChild(b);
-  }
+let rulesSig = '';
+function renderRules() {
+  const b = state.htask?.bucketing;
+  const shift = typeof b?.immediateShift === 'number' ? b.immediateShift : null;
+  const secs  = typeof b?.scheduledBucketSeconds === 'number' ? b.scheduledBucketSeconds : null;
+
+  const sig = `${shift}|${secs}`;
+  if (sig === rulesSig) return;
+  rulesSig = sig;
+
+  const perBucket = shift === null ? null : 2 ** shift;
+
+  el.rules.innerHTML = `
+    <div class="rule" data-kind="immediate">
+      <span class="rule-kind">Immediate</span>
+      <span class="rule-cats">transfer · visibility · outbound</span>
+      <div class="rule-body">
+        <p class="rule-line"><span class="rule-tag">bucket</span>
+          <code>taskID &gt;&gt; ${shift === null ? '?' : esc(shift)}</code>
+          <span class="rule-why">${perBucket === null ? '' : `${esc(nfmt(perBucket))} task ids per record`}</span></p>
+        <p class="rule-line"><span class="rule-tag">map key</span>
+          <code>int64 taskID</code>
+          <span class="rule-why">ordered by task id alone</span></p>
+      </div>
+    </div>
+    <div class="rule" data-kind="scheduled">
+      <span class="rule-kind">Scheduled</span>
+      <span class="rule-cats">timer</span>
+      <div class="rule-body">
+        <p class="rule-line"><span class="rule-tag">bucket</span>
+          <code>fireTime ÷ ${secs === null ? '?' : esc(secs)}s</code>
+          <span class="rule-why">${secs === null ? '' : `one record per ${esc(secs)} seconds of fire time`}</span></p>
+        <p class="rule-line"><span class="rule-tag">map key</span>
+          <code>16-byte blob: BE(fireTime) ‖ BE(taskID)</code>
+          <span class="rule-why">bytewise order = <code>(fireTime, taskID)</code></span></p>
+      </div>
+    </div>`;
 }
 
-let recordsSig = '';
-function renderRecords() {
-  if (!state.selectedSet) {
-    el.records.hidden = true;
-    recordsSig = '';
-    return;
-  }
-  el.records.hidden = false;
-  el.recordsSet.textContent = state.selectedSet;
+/* ── the bucket view ───────────────────────────────────────────────────── */
 
-  const meta = state.sets.find((s) => s.name === state.selectedSet);
-  el.recordsDesc.textContent = meta?.description || '';
+let htaskSig = '';
+function renderHtask() {
+  const data = state.htask;
+  const shards = Array.isArray(data?.shards) ? data.shards : [];
 
-  const n = state.records?.length ?? 0;
-  el.recordsCount.textContent = state.recordsBusy
-    ? 'loading…'
-    : state.records === null ? ''
-    : `showing ${n}${n >= RECORD_LIMIT ? ` of ${nfmt(meta?.objects)}` : ''}`;
-
-  const sig = JSON.stringify({ s: state.selectedSet, r: state.records, e: state.recordsErr, b: state.recordsBusy });
-  if (sig === recordsSig) return;
-  recordsSig = sig;
-
-  el.recordsList.textContent = '';
-
-  if (state.recordsErr) {
-    el.recordsList.appendChild(emptyLine(`Could not read records: ${state.recordsErr}`));
-    return;
-  }
-  if (state.records === null) {
-    el.recordsList.appendChild(emptyLine('Loading records…'));
-    return;
-  }
-  if (state.records.length === 0) {
-    el.recordsList.appendChild(emptyLine(
-      `No records in ${state.selectedSet} yet — the set exists but holds nothing right now.`));
-    return;
+  // Empty / error states first — they replace the view entirely.
+  let emptyMsg = '';
+  if (state.htaskErr && state.serverUp) {
+    emptyMsg = `Could not read history tasks: ${state.htaskErr}`;
+  } else if (shards.length === 0) {
+    emptyMsg = isSwitching()
+      ? 'Reconfiguring — buckets appear once Temporal writes its first history task.'
+      : onAerospike()
+        ? 'No history tasks in Aerospike right now. Run a workflow: transfer and timer tasks are written, drained by the history service, and show up here — including the buckets they leave behind.'
+        : 'Temporal is on SQLite, so nothing is stored here yet. Switch the store, run the workflow, and its task queues appear as bucketed Aerospike records.';
   }
 
-  for (const rec of state.records) el.recordsList.appendChild(recordCard(rec));
+  el.htaskEmpty.hidden = !emptyMsg;
+  el.htaskEmpty.textContent = emptyMsg;
+
+  const sig = JSON.stringify({ d: data, e: state.htaskErr, s: !!emptyMsg });
+  if (sig === htaskSig) return;
+  htaskSig = sig;
+
+  el.htask.textContent = '';
+  if (emptyMsg) return;
+
+  const bucketing = data?.bucketing || {};
+  for (const shard of shards) el.htask.appendChild(shardBlock(shard, bucketing));
+}
+
+function shardBlock(shard, bucketing) {
+  const sec = document.createElement('section');
+  sec.className = 'shard';
+
+  const head = document.createElement('header');
+  head.className = 'shard-head';
+  head.innerHTML = `
+    <span class="shard-badge">shard <b>${esc(shard.shardId)}</b></span>
+    <span class="shard-note">Cassandra would keep all of this in one partition keyed
+      <code>shard_id = ${esc(shard.shardId)}</code>.</span>`;
+  sec.appendChild(head);
+
+  const cats = Array.isArray(shard.categories) ? shard.categories : [];
+  for (const cat of cats) sec.appendChild(categoryBlock(shard, cat, bucketing));
+  if (cats.length === 0) sec.appendChild(emptyLine('No task categories in this shard.'));
+  return sec;
+}
+
+function categoryBlock(shard, cat, bucketing) {
+  const scheduled = !!cat.scheduled;
+  const wrap = document.createElement('div');
+  wrap.className = 'cat';
+  wrap.dataset.scheduled = String(scheduled);
+
+  const head = document.createElement('div');
+  head.className = 'cat-head';
+  head.innerHTML = `
+    <span class="cat-name">${esc(cat.name ?? 'category')}</span>
+    <span class="cat-id">category&nbsp;${esc(cat.id)}</span>
+    <span class="kind" data-scheduled="${scheduled}">${scheduled ? 'scheduled' : 'immediate'}</span>
+    <span class="cat-key">map key ${scheduled
+      ? '<code>BE(fireTime) ‖ BE(taskID)</code>'
+      : '<code>int64 taskID</code>'}</span>`;
+  wrap.appendChild(head);
+
+  const rail = document.createElement('div');
+  rail.className = 'rail';
+
+  const axis = document.createElement('div');
+  axis.className = 'rail-axis';
+  axis.innerHTML = `<span class="axis-text">range read walks buckets in ascending order</span><span class="axis-arrow" aria-hidden="true"></span>`;
+  wrap.appendChild(axis);
+
+  const buckets = Array.isArray(cat.buckets) ? cat.buckets : [];
+  buckets.forEach((b, i) => {
+    if (i > 0) {
+      const chev = document.createElement('span');
+      chev.className = 'rail-chev';
+      chev.setAttribute('aria-hidden', 'true');
+      chev.textContent = '›';
+      rail.appendChild(chev);
+    }
+    rail.appendChild(bucketCard(shard, cat, b, bucketing));
+  });
+  if (buckets.length === 0) rail.appendChild(emptyLine('No buckets — this queue has never been written.'));
+
+  wrap.appendChild(rail);
+  return wrap;
+}
+
+/* The visible bucket boundary. This is the bit that turns a list of tasks into
+   an explanation: the boundary is computed from the bucketing function the API
+   reports, not from the entries that happen to be inside. */
+function boundaryText(cat, b, bucketing) {
+  const n = Number(b.bucket);
+  if (!isFinite(n)) return '';
+
+  if (cat.scheduled) {
+    const secs = Number(bucketing.scheduledBucketSeconds);
+    if (!isFinite(secs) || secs <= 0) return '';
+    const from = new Date(n * secs * 1000);
+    const to   = new Date((n + 1) * secs * 1000);
+    return `fires ${fmtClock(from, { ms: false })} → ${fmtClock(to, { ms: false })}`;
+  }
+
+  const shift = Number(bucketing.immediateShift);
+  if (!isFinite(shift) || shift < 0) return '';
+  const lo = n * 2 ** shift;
+  const hi = lo + 2 ** shift - 1;
+  return `task ids ${nfmt(lo)} → ${nfmt(hi)}`;
+}
+
+function bucketCard(shard, cat, b, bucketing) {
+  const count   = Number(b.count) || 0;
+  const entries = Array.isArray(b.entries) ? b.entries : [];
+  const empty   = count === 0;
+
+  const art = document.createElement('article');
+  art.className = 'bucket';
+  art.dataset.empty = String(empty);
+
+  const head = document.createElement('header');
+  head.className = 'bk-head';
+  head.innerHTML = `
+    <span class="bk-n">bucket <b>${esc(b.bucket)}</b></span>
+    <span class="bk-count">${esc(nfmt(count))}<span class="unit">${count === 1 ? 'entry' : 'entries'}</span></span>`;
+  art.appendChild(head);
+
+  const key = document.createElement('code');
+  key.className = 'bk-key';
+  key.textContent = b.recordKey ?? `${shard.shardId}:${cat.id}:${b.bucket}`;
+  art.appendChild(key);
+
+  const bound = boundaryText(cat, b, bucketing);
+  if (bound) {
+    const bd = document.createElement('div');
+    bd.className = 'bk-bound';
+    bd.textContent = bound;
+    art.appendChild(bd);
+  }
+
+  if (empty) {
+    const p = document.createElement('p');
+    p.className = 'bk-drained';
+    p.textContent = 'drained — every task acked and removed, but the record itself has not been retired yet';
+    art.appendChild(p);
+  } else {
+    const ol = document.createElement('ol');
+    ol.className = 'bk-entries';
+    // Server order, verbatim. Do not sort.
+    for (const e of entries) ol.appendChild(entryRow(cat, e));
+    art.appendChild(ol);
+
+    if (entries.length < count) {
+      const more = document.createElement('p');
+      more.className = 'bk-more';
+      more.textContent = `+ ${nfmt(count - entries.length)} more in this record — the API returns the first ${nfmt(entries.length)}`;
+      art.appendChild(more);
+    }
+  }
+
+  const foot = document.createElement('footer');
+  foot.className = 'bk-foot';
+  foot.innerHTML = `K-ordered map <code>t</code>${empty ? '' : ' — returned in key order by the server'}`;
+  art.appendChild(foot);
+
+  return art;
+}
+
+function valueTag(e) {
+  const val = document.createElement('span');
+  val.className = 'ent-val';
+  val.title = 'serialized proto — held as bytes, never decoded by the store';
+  val.textContent = `blob ${fmtBytes(e.bytes) || '—'}`;
+  return val;
+}
+
+function entryRow(cat, e) {
+  const li = document.createElement('li');
+  const hexes = cat.scheduled ? scheduledKeyHex(e.fireTime, e.taskId) : null;
+
+  // Scheduled: the map key is 16 bytes, so it gets a line of its own and the
+  // human reading of it sits underneath. Immediate: the map key IS the task id,
+  // so one line is the whole story.
+  if (hexes) {
+    li.className = 'ent ent-sched';
+    const kb = document.createElement('span');
+    kb.className = 'kb';
+    kb.innerHTML =
+      `<span class="kb-fire" title="big-endian fireTime nanos">${esc(hexes.fire)}</span>` +
+      `<span class="kb-join">‖</span>` +
+      `<span class="kb-id" title="big-endian task id">${esc(hexes.id)}</span>`;
+
+    const foot = document.createElement('span');
+    foot.className = 'ent-foot';
+    const dec = document.createElement('span');
+    dec.className = 'ent-decoded';
+    dec.textContent = `${fmtClock(e.fireTime)} · task ${nfmt(e.taskId)}`;
+    foot.append(dec, valueTag(e));
+
+    li.append(kb, foot);
+    return li;
+  }
+
+  li.className = 'ent';
+  const keyBox = document.createElement('span');
+  keyBox.className = 'ent-key';
+
+  if (typeof e.taskId === 'number') {
+    keyBox.innerHTML = `<span class="kb"><span class="kb-id">${esc(nfmt(e.taskId))}</span></span>`;
+    // The label is only worth a second line when it says something the key does
+    // not — "task 1048587" under 1,048,587 is noise.
+    if (e.label && e.label !== `task ${e.taskId}`) {
+      const d = document.createElement('span');
+      d.className = 'ent-decoded';
+      d.textContent = e.label;
+      keyBox.appendChild(d);
+    }
+  } else {
+    keyBox.innerHTML = `<span class="kb">${esc(e.label ?? '(no key)')}</span>`;
+  }
+
+  li.append(keyBox, valueTag(e));
+  return li;
 }
 
 function emptyLine(text) {
@@ -685,51 +950,18 @@ function emptyLine(text) {
   return p;
 }
 
-function recordCard(rec) {
-  const art = document.createElement('article');
-  art.className = 'rec';
-
-  const head = document.createElement('header');
-  head.className = 'rec-head';
-  head.innerHTML = `
-    <code class="rec-key">${esc(rec.key ?? '(no key)')}</code>
-    <span class="rec-digest">digest ${esc(rec.digest ?? '—')}</span>`;
-  art.appendChild(head);
-
-  const bins = document.createElement('div');
-  bins.className = 'bins';
-  for (const bin of rec.bins ?? []) {
-    const opaque = isOpaque(bin.type);
-    const row = document.createElement('div');
-    row.className = 'bin';
-    row.innerHTML = `
-      <span class="bin-name">${esc(bin.name)}</span>
-      <span class="type-tag" data-opaque="${opaque}">${esc(bin.type ?? '?')}</span>
-      <span class="bin-size">${esc(fmtBytes(bin.size))}</span>
-      <span class="bin-preview" data-opaque="${opaque}"></span>`;
-
-    // Previews are server-supplied strings — set as text, never as markup.
-    const prev = row.querySelector('.bin-preview');
-    prev.textContent = bin.preview ?? '';
-    if (opaque) {
-      const note = document.createElement('span');
-      note.className = 'opaque-note';
-      note.textContent = 'serialized proto — held as bytes, not decoded';
-      prev.appendChild(note);
-    }
-    bins.appendChild(row);
-  }
-  if (!(rec.bins ?? []).length) bins.appendChild(emptyLine('No bins returned for this record.'));
-  art.appendChild(bins);
-  return art;
-}
-
 /* ── wiring ────────────────────────────────────────────────────────────── */
 
 el.btnRun.addEventListener('click', runWorkflow);
 el.btnSwitch.addEventListener('click', startSwitch);
-el.btnCloseRecs.addEventListener('click', closeRecords);
+el.btnReset.addEventListener('click', askReset);
+el.btnResetCancel.addEventListener('click', cancelReset);
+el.btnResetGo.addEventListener('click', startReset);
 el.btnClearLog.addEventListener('click', () => { el.log.textContent = ''; });
+
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && state.confirmReset) cancelReset();
+});
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {

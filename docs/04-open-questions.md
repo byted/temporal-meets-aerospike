@@ -79,6 +79,59 @@ with (a); if assertions on the returned fields are flaky, switch to (b).
 
 ---
 
+## Q7 — The first workflow after a switch to Aerospike intermittently stalls
+
+**Status:** open, parked · raised 2026-09-07
+
+The first workflow after switching to Aerospike sometimes takes tens of seconds instead of ~50 ms.
+Two explanations have been proposed and both are disproved. Recording what is established so the
+next attempt does not re-derive it.
+
+### Established
+
+- **The gap is `WorkflowTaskScheduled` → `WorkflowTaskStarted`**, on attempt 1, with no
+  `WORKFLOW_TASK_TIMED_OUT` event. The task is scheduled and simply not handed to a poller. Sample:
+  scheduled `00:38:08.597`, started `00:39:07.217`.
+- **Everything either side is fast.** The start call returns in 2.7 ms; once the task is delivered
+  the rest of the workflow completes in ~15 ms.
+- **Bounded by matching's long-poll cycle.** Observed 31.6 s, 43.1 s, 52.2 s, 53.1 s, 58.6 s, once
+  past 60 s — uniformly distributed inside the 60 s window, not clustered. That distribution is the
+  signature of waiting for a poll boundary rather than of a cold start.
+- **Triggered by CPU contention during Temporal's startup.** Under load: 3 stalls in 4 switches.
+  Idle: 0 in roughly 17.
+- **Aerospike-only.** 0 stalls in 15 switches to SQLite, including 4 under the same load. SQLite
+  delivers in ~83 ms where Aerospike takes 43 s.
+- **Silent.** Nothing is logged by the worker or the server during the gap — no poll errors, no
+  retries, no backoff.
+
+### Ruled out, with evidence
+
+| Hypothesis | Why not |
+|---|---|
+| Cold start | Would be deterministic; this is intermittent and uniformly distributed |
+| Namespace cache propagation | `DescribeNamespace` resolves in 0–5 ms; the workflow *started*, so the namespace was visible to frontend, history and matching |
+| Sticky task queue | Event 2 names the normal queue; the sticky queue first appears after the stall |
+| Task timeout and reschedule | Attempt stays 1, no timeout events — one continuous wait |
+| Slow worker or activity path | Started→Completed is 17 ms; activity deltas are single-digit ms |
+| **Four partitions, one poller** | Pinned to 1 read/write partition, confirmed applied in the server log, stall still reproduced at 31.6 s |
+| Worker-side poll backoff | Nothing logged during the gap; SDK reports no retries |
+
+### Where the evidence now points
+
+The store's own matching task path. It is Aerospike-only, silent, and server-side, and the
+investigation measured this store's matching backlog read at ~650 ms–3.1 s per round trip against
+SQLite's ~20 ms. A plausible mechanism — untested — is `GetTasks` returning an empty page when it
+should not, so matching sees no backlog and waits out a poll cycle. `store/aerospike/task_queue_store.go`
+and the bucket index described in [03-data-model.md](03-data-model.md) are where to look.
+
+### Kept in the meantime
+
+`matching.numTaskqueue{Read,Write}Partitions: 1` and a gRPC readiness probe are both retained.
+Neither fixes this, but both are correct for a single-worker deployment. The 90 s warm-up in
+`runSwitch` stays as a bandage and is commented as one.
+
+---
+
 ## Resolved
 
 ### R22 — The backend switch works, verified on a real cluster

@@ -70,26 +70,25 @@ sequenceDiagram
 Skip the namespace registration and "Run workflow" fails immediately after every switch, with an
 error that points nowhere useful.
 
-## The first run after a switch is slow, so the switch absorbs it
+## The first run after a switch is sometimes slow, and we do not know why
 
-Measured on the deployed box: the first workflow after a switch took **43 s**, against ~50 ms
-steady state. It does not happen every time, which makes it worse — the demo's whole claim is that
-the workflow behaves identically on either store, and an unexplained 40-second hang after clicking
-**Run workflow** reads as broken rather than as a cold start.
+Measured on the deployed box: the first workflow after a switch to Aerospike intermittently stalls
+for tens of seconds — 31.6 s, 43.1 s, 52.2 s, 53.1 s, 58.6 s, and once past 60 s — against ~50 ms
+steady state.
 
-The cause is a task queue that matching has just had to create while a poller was already
-long-polling it. Rather than leave it to chance, `runSwitch` executes one throwaway workflow before
-reporting the switch complete.
+`runSwitch` runs a throwaway workflow before reporting the switch complete, which moves the wait
+into the progress log where it is expected rather than leaving it behind a button that should feel
+instant. **That is a bandage, not a fix.** The switch costs ~69 s when the stall occurs and ~15 s
+when it does not.
 
-The trade-off is explicit: **the switch goes from ~15 s to ~69 s**, and the presenter's next click
-is ~45 ms. The same wall-clock time is spent either way; this spends it against a live progress log,
-where waiting is expected, instead of behind a button that is supposed to feel instant.
+An earlier version of this file attributed the stall to "a task queue that matching has just had to
+create while a poller was already long-polling it", and a subsequent investigation attributed it to
+a four-partition task queue served by a single poller. **Both explanations are wrong**, or at least
+insufficient: pinning the queue to one partition was applied, confirmed in effect, and the stall
+still reproduced at 31.6 s. See Q7 in [04-open-questions.md](04-open-questions.md) for what is
+actually known.
 
-If a fast switch matters more than a fast first click, drop the warm-up block in
-`control/server.go` — it is deliberately self-contained, and a warm-up failure never fails the
-switch.
-
-## Deliberate scope
+## Deliberate scope## Deliberate scope
 
 - **No data migration.** Switching stores means the previous store's workflows are simply not there.
   That is the honest behaviour, and saying so is part of the demo.
@@ -108,6 +107,22 @@ switch.
 |---|---|---|
 | Control plane | `cmd/control-plane`, `control/` | Orchestration, Temporal worker, Aerospike browser, HTTP + SSE |
 | Web UI | `control/web/` | Plain HTML/JS/CSS, no build step, embedded via `go:embed` |
+
+The UI shows the `htask` set alone, decomposed into shard → category → bucket, rather than a flat
+list of every set. That set is where the interesting part of the data model lives: the record key is
+`<shard>:<category>:<bucket>`, buckets are ordered so a range read walks them in sequence, and the
+server returns entries within a bucket in key order. Immediate and scheduled categories use
+different key encodings and are rendered differently, because they *are* different.
+
+**The workflow reports which store it ran on.** The greeting used to be a constant reading
+"from Aerospike" regardless of backend, so a SQLite run claimed to be an Aerospike one and the demo
+proved nothing. The activity now asks the server (`GetClusterInfo` — note there is no
+`DescribeCluster` RPC; `persistence_store` lives on that response) once per execution rather than
+caching at worker startup, since the store changes underneath a long-lived worker.
+
+**Reset** wipes Aerospike and returns to SQLite. Order matters: the switch happens *first*, then the
+wipe. Truncating while Aerospike is still the active backend would leave a live server holding shard
+leases in a store whose contents had vanished.
 | Manifests | `deploy/k8s/` | k3s: Aerospike StatefulSet, Temporal, UI, control plane, RBAC, ingress |
 | Install guide | `deploy/k8s/README.md` | Fresh box to running demo |
 

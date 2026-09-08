@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"go.temporal.io/api/serviceerror"
+	workflowservice "go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 )
@@ -89,16 +90,39 @@ func TestWorkflowWithActivity(t *testing.T) {
 	}
 	t.Logf("workflow started: id=%s run=%s", run.GetID(), run.GetRunID())
 
-	var greeting string
-	if err := run.Get(ctx, &greeting); err != nil {
+	var result GreetResult
+	if err := run.Get(ctx, &result); err != nil {
 		t.Fatalf("workflow failed: %v", err)
 	}
 
-	const want = "Hello world, from Aerospike"
-	if greeting != want {
-		t.Fatalf("got %q, want %q", greeting, want)
+	// The expectation is derived, not hardcoded: this suite runs against
+	// whichever store the environment is on, and the point of the assertion is
+	// that the run names the store it *actually* used. Asking the server here,
+	// through this test's own client, is an independent answer -- a workflow
+	// that named a constant would fail this on one of the two stores, which is
+	// the bug that went unnoticed while the greeting was fixed at "Aerospike".
+	info, err := c.WorkflowService().GetClusterInfo(ctx,
+		&workflowservice.GetClusterInfoRequest{})
+	if err != nil {
+		t.Fatalf("describing cluster: %v", err)
 	}
-	t.Logf("workflow completed: %s", greeting)
+	wantStore := info.GetPersistenceStore()
+	switch wantStore {
+	case "sqlite", "aerospike":
+	default:
+		t.Fatalf("server reports persistence store %q, want %q or %q",
+			wantStore, "sqlite", "aerospike")
+	}
+
+	if result.PersistenceStore != wantStore {
+		t.Fatalf("run reports persistence store %q, want %q",
+			result.PersistenceStore, wantStore)
+	}
+	want := "Hello world, from " + storeDisplayName(wantStore)
+	if result.Greeting != want {
+		t.Fatalf("got %q, want %q", result.Greeting, want)
+	}
+	t.Logf("workflow completed on %s: %s", result.PersistenceStore, result.Greeting)
 
 	// Describe it back: this reads mutable state and the current-execution
 	// pointer through the store, which a completed run alone does not prove.

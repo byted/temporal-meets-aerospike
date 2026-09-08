@@ -25,8 +25,9 @@ import (
 var webAssets embed.FS
 
 // switchTimeout bounds a whole switch -- worker down, patch, rollout, namespace,
-// worker up. It exists so a wedged switch eventually releases the lock and the
-// operator can try again, rather than needing a restart mid-demo.
+// worker up -- and, with it, a reset, which is that sequence plus a truncate.
+// It exists so a wedged switch eventually releases the lock and the operator
+// can try again, rather than needing a restart mid-demo.
 const switchTimeout = 10 * time.Minute
 
 // Server wires the three subsystems to the HTTP contract the UI is built
@@ -161,10 +162,12 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("POST /api/switch", s.handleSwitch)
+	mux.HandleFunc("POST /api/reset", s.handleReset)
 	mux.HandleFunc("POST /api/workflow/run", s.handleRunWorkflow)
 	mux.HandleFunc("GET /api/aerospike/health", s.handleAerospikeHealth)
 	mux.HandleFunc("GET /api/aerospike/sets", s.handleAerospikeSets)
 	mux.HandleFunc("GET /api/aerospike/records", s.handleAerospikeRecords)
+	mux.HandleFunc("GET /api/aerospike/history-tasks", s.handleAerospikeHistoryTasks)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 
 	web, err := fs.Sub(webAssets, "web")
@@ -246,22 +249,55 @@ func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if !s.begin(w, fmt.Sprintf("backend switch to %s", target),
+		func(ctx context.Context) error { return s.runSwitch(ctx, target) }) {
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]string{"backend": string(target)})
+}
+
+// handleReset returns the demo to step 1: Temporal back on SQLite and an empty
+// Aerospike namespace, so the whole narrative can be run again.
+//
+// It is the same kind of operation as a switch -- long, disruptive, and
+// restarting Temporal -- so it answers the same way: 202 and progress on the
+// event stream, sharing the one in-flight flag /api/state exposes as
+// `switching`. That flag is what keeps the UI's buttons disabled and lets it
+// tolerate Temporal going away mid-operation, and it is why a reset and a
+// switch cannot overlap.
+func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
+	if !s.begin(w, "demo reset", s.runReset) {
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"backend": string(BackendSQLite)})
+}
+
+// begin claims the in-flight flag and runs op in the background, or writes the
+// refusal itself and reports false.
+//
+// Shared by /api/switch and /api/reset so there is exactly one place that
+// decides what "already busy" means. Both need Kubernetes, so both fail the
+// same way without it: without the ability to move Temporal off Aerospike, a
+// reset could only wipe the store out from under a running server.
+func (s *Server) begin(w http.ResponseWriter, name string, op func(context.Context) error) bool {
 	if s.backend == nil {
 		writeError(w, http.StatusServiceUnavailable, s.backendErr)
-		return
+		return false
 	}
 
 	s.mu.Lock()
 	if s.switching {
 		s.mu.Unlock()
-		writeError(w, http.StatusConflict, errors.New("a backend switch is already in progress"))
-		return
+		writeError(w, http.StatusConflict,
+			errors.New("a backend switch or reset is already in progress"))
+		return false
 	}
 	s.switching = true
 	s.mu.Unlock()
 
 	// Detached from the request: the handler returns 202 immediately and the
-	// switch outlives it. Using r.Context() here would cancel the rollout the
+	// work outlives it. Using r.Context() here would cancel the rollout the
 	// moment the browser got its response.
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), switchTimeout)
@@ -273,13 +309,25 @@ func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 			s.events.publish(newStateEvent(s.state(ctx)))
 		}()
 
-		if err := s.runSwitch(ctx, target); err != nil {
-			s.logger.Error("backend switch failed", "target", target, "error", err)
+		if err := op(ctx); err != nil {
+			s.logger.Error(name+" failed", "error", err)
 			s.events.publish(Event{Type: EventError, Message: err.Error(), Ts: time.Now()})
+
+			// Bring the worker back.
+			//
+			// Every one of these sequences stops the worker as its first step,
+			// so a failure part-way leaves the demo with no worker at all and
+			// the run button answering 503 -- not just for this attempt, but
+			// until someone happens to run a *successful* switch. A failed
+			// switch should cost you the switch, not the demo.
+			//
+			// ensureReady already retries with backoff and is a no-op if the
+			// worker is running, so this is safe whether the failure happened
+			// before or after the restart step.
+			go s.ensureReady()
 		}
 	}()
-
-	writeJSON(w, http.StatusAccepted, map[string]string{"backend": string(target)})
+	return true
 }
 
 // runSwitch performs the switch in the only order that leaves a working demo.
@@ -318,29 +366,83 @@ func (s *Server) runSwitch(ctx context.Context, target Backend) error {
 		return err
 	}
 
-	// Warm the task queue before declaring the switch done.
+	// Absorb the stall. This is a bandage over an unsolved bug, and is kept
+	// only so the demo stays usable.
 	//
-	// The first workflow after a switch is intermittently slow -- measured at
-	// 43s against ~50ms steady state, on a task queue that matching has just
-	// had to create while a poller was already long-polling it. It does not
-	// happen every time, which makes it worse: the demo's whole claim is that
-	// the workflow behaves identically on either store, and an unexplained
-	// 40-second hang after clicking Run reads as broken.
+	// The first workflow after a switch to Aerospike intermittently stalls for
+	// tens of seconds -- measured at 31.6s, 43.1s, 52.2s, 53.1s, 58.6s and once
+	// past 60s, always bounded by matching's 60s long-poll cycle. It reproduces
+	// under CPU contention and essentially never on an idle box.
 	//
-	// Absorbing it here costs the same wall-clock time but spends it where
-	// waiting is expected and visible, against a live progress log.
+	// What is known, and what is not:
+	//   - The gap is WorkflowTaskScheduled -> WorkflowTaskStarted, attempt 1,
+	//     with no timeout events. The task is scheduled and simply not handed
+	//     to the poller.
+	//   - It is Aerospike-only. The same switch to SQLite delivers in ~83ms,
+	//     including under the same load.
+	//   - It is silent: the worker starts, then nothing is logged by either
+	//     side until the task is finally delivered.
+	//   - Pinning the task queue to one partition did NOT fix it, though the
+	//     setting is correct for a single-worker deployment and is kept.
 	//
-	// Best-effort: a warm-up failure is not a switch failure. The store is
-	// already serving at this point, and reporting otherwise would be wrong.
-	report("warming up the task queue")
+	// So the mechanism is still unknown, and the evidence now points at the
+	// store's own matching task path rather than at Temporal's configuration.
+	// See docs/04-open-questions.md.
+	//
+	// 90s because the stall is bounded by the 60s poll cycle; a shorter timeout
+	// just moves the wait in front of the presenter's button instead.
+	report("checking the task queue")
 	warmCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	if _, err := s.runner.Run(warmCtx); err != nil {
-		s.logger.Warn("task queue warm-up failed; the first run may be slow", "error", err)
-		report("warm-up did not complete; the first run may be slow")
+		s.logger.Warn("post-switch smoke test failed; the first run may be slow", "error", err)
+		report("smoke test did not complete; the first run may be slow")
 	}
 	cancel()
 
 	report(fmt.Sprintf("now running on %s", target))
+	return nil
+}
+
+// runReset puts the demo back to step 1: Temporal on SQLite, Aerospike empty.
+//
+// The order is switch first, wipe second, and the other order is broken in a
+// way that is worth spelling out. While Aerospike is the active backend,
+// Temporal is *using* it continuously -- it holds shard leases there, and every
+// range-ID check, task-queue poll and history append reads or writes those
+// sets. Truncating underneath a live server does not reset it; it leaves a
+// running Temporal serving from a store whose contents vanished, which surfaces
+// as shard-ownership-lost and missing-namespace errors from a process that
+// still believes it owns everything. The subsequent switch would then be a
+// rollout out of an already-broken state.
+//
+// Switching to SQLite first ends that relationship completely: the pod is
+// replaced and the new one never opens Aerospike at all, so by the time
+// Truncate runs, nothing is reading or writing the sets it empties. The cost is
+// that Aerospike keeps the old data for the length of the rollout, which is
+// harmless -- it is about to be deleted and nothing points at it any more.
+//
+// runSwitch is reused rather than reimplemented: stopping the worker, patching,
+// waiting for the rollout, re-registering the namespace in the now-empty SQLite
+// store and restarting the worker are all required here for exactly the same
+// reasons, and a second copy of that sequence is a second thing to get wrong.
+func (s *Server) runReset(ctx context.Context) error {
+	report := func(msg string) {
+		s.logger.Info("reset", "step", msg)
+		s.events.publish(Event{Type: EventProgress, Message: msg, Ts: time.Now()})
+	}
+
+	report("resetting the demo: moving Temporal back to SQLite, then wiping Aerospike")
+
+	if err := s.runSwitch(ctx, BackendSQLite); err != nil {
+		return err
+	}
+
+	report("wiping every Aerospike set the store uses")
+	if err := s.browser.Truncate(ctx); err != nil {
+		return fmt.Errorf("wiping Aerospike: %w", err)
+	}
+
+	report("reset complete: Temporal is on sqlite and Aerospike is empty")
 	return nil
 }
 
@@ -349,7 +451,7 @@ func (s *Server) handleRunWorkflow(w http.ResponseWriter, r *http.Request) {
 	switching := s.switching
 	s.mu.Unlock()
 	if switching {
-		writeError(w, http.StatusConflict, errors.New("a backend switch is in progress"))
+		writeError(w, http.StatusConflict, errors.New("a backend switch or reset is in progress"))
 		return
 	}
 
@@ -374,6 +476,19 @@ func (s *Server) handleRunWorkflow(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAerospikeHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.browser.Health(r.Context()))
+}
+
+// handleAerospikeHistoryTasks serves the bucket view: the htask set decomposed
+// into shard, category and bucket. This is what the UI renders in place of a
+// flat record list, because the bucketing is the part of the data model worth
+// explaining.
+func (s *Server) handleAerospikeHistoryTasks(w http.ResponseWriter, r *http.Request) {
+	view, err := s.browser.HistoryTasks(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 func (s *Server) handleAerospikeSets(w http.ResponseWriter, r *http.Request) {

@@ -7,8 +7,14 @@
  *
  *   - a scripted "switch to Aerospike" that takes ~16s and drops the server
  *     mid-way, so the reconnect / expected-downtime paths get exercised
- *   - object counts that climb as workflows run
- *   - one set ("nexus") that stays empty, to exercise the zero-record view
+ *   - a scripted "reset" that wipes the world and goes back to SQLite, dropping
+ *     the server the same way
+ *   - a bucket layout for /api/aerospike/history-tasks with more than one shard,
+ *     immediate and scheduled categories, several buckets each, a drained
+ *     (count 0) bucket, and a bucket whose entry list is capped
+ *
+ * Everything the endpoint returns is already in order — shards, categories,
+ * buckets and entries — exactly as the real API promises.
  *
  * Preview:
  *     cd control/web && python3 -m http.server 8000
@@ -31,26 +37,140 @@ const world = {
   runSeq: 0,
 };
 
-const SETS = [
-  { name: 'shard',       base: 4, per: 0, description: 'Shard ownership leases. One record per history shard; range_id is the fencing token every conditional write is checked against.' },
-  { name: 'exec',        base: 0, per: 1, description: 'Mutable workflow state — one record per run. Pending activities, timers, child workflows and signals live in ordered maps inside that single record.' },
-  { name: 'curr',        base: 0, per: 1, description: 'Current-execution pointer. Maps a workflow ID to the run ID that is currently active, so a second start can be rejected.' },
-  { name: 'htask',       base: 0, per: 6, description: 'History task queues — transfer, timer and visibility tasks, bucketed into K-ordered maps so a range scan becomes a walk over buckets.' },
-  { name: 'hnode',       base: 0, per: 4, description: 'History events. Each record holds one batch of workflow history events as a serialized proto blob; this is the immutable log.' },
-  { name: 'hbranch',     base: 0, per: 1, description: 'History branch index. A K-ordered map of node ID to transaction ID — the read path scans this first, then batch-gets only the page it needs.' },
-  { name: 'htree',       base: 0, per: 1, description: 'History trees. Tracks the branches created by workflow resets and retries.' },
-  { name: 'tq',          base: 2, per: 0, description: 'Task queue metadata: the range_id lease held by matching, plus worker user data and its version.' },
-  { name: 'task',        base: 0, per: 2, description: 'Dispatchable tasks waiting for a worker, in bucketed K-ordered maps keyed by task ID.' },
-  { name: 'ns',          base: 3, per: 0, description: 'Namespace registry, plus the name-to-ID pointer records that make lookup by name possible.' },
-  { name: 'nsmeta',      base: 1, per: 0, description: 'Namespace metadata — a single record holding the global notification version.' },
-  { name: 'clustermeta', base: 2, per: 0, description: 'Cluster metadata and membership records for this Temporal cluster.' },
-  { name: 'nexus',       base: 0, per: 0, description: 'Nexus endpoint registry. Empty until a Nexus endpoint is created — a good example of a set that exists in the model but holds nothing.' },
-];
+/* ── bucketing, mirrored from store/aerospike/tasks.go ─────────────────── */
 
-const setCount = (s) => s.base + s.per * world.runs;
-const totalObjects = () => SETS.reduce((n, s) => n + setCount(s), 0);
+const IMMEDIATE_SHIFT         = 12;          // 4096 task ids per bucket
+const SCHEDULED_BUCKET_SECONDS = 60;         // one bucket per minute
+const ENTRY_CAP                = 6;          // what the API returns per bucket
 
-/* ── deterministic fake payloads ───────────────────────────────────────── */
+/* Fixed at load so repeated polls return stable timestamps rather than a
+   clock that visibly crawls under the viewer. */
+const MINUTE0 = Math.floor(Date.now() / 60000) - 2;
+
+/* ── the bucket layout ─────────────────────────────────────────────────── */
+
+/* Entries in an immediate bucket: map key is the int64 task id itself. */
+function immediateEntries(bucket, offsets) {
+  const base = bucket * 2 ** IMMEDIATE_SHIFT;
+  return offsets.map((off, i) => {
+    const taskId = base + off;
+    return { label: `task ${taskId}`, taskId, fireTime: null, bytes: 132 + ((i * 17) % 61) };
+  });
+}
+
+/* Entries in a scheduled bucket: map key is BE(fireTime)||BE(taskID), so the
+   pair is what determines order. Seconds stay inside the bucket's minute. */
+function scheduledEntries(bucket, specs) {
+  const baseMs = bucket * SCHEDULED_BUCKET_SECONDS * 1000;
+  return specs.map(([sec, taskId], i) => {
+    const fire = new Date(baseMs + sec * 1000);
+    return {
+      label: `${fire.toISOString()} · task ${taskId}`,
+      taskId,
+      fireTime: fire.toISOString(),
+      bytes: 148 + ((i * 23) % 47),
+    };
+  });
+}
+
+function bucketOf(shardId, catId, bucket, count, entries) {
+  return {
+    bucket,
+    recordKey: `${shardId}:${catId}:${bucket}`,
+    count,
+    entries: entries.slice(0, ENTRY_CAP),
+  };
+}
+
+/* A layout rich enough to be worth looking at:
+ *
+ *   shard 1 · transfer   three buckets, the middle one drained
+ *   shard 1 · timer      two minutes of timers, second one drained
+ *   shard 3 · transfer   a hot bucket well past the entry cap, then a fresh one
+ *   shard 3 · timer      one minute of timers
+ *   shard 3 · visibility a single small bucket
+ *
+ * Counts grow as workflows are run, so the view moves during the demo.
+ */
+function historyTasks() {
+  const n = world.runs;
+
+  const shard1Transfer = (() => {
+    const b0 = immediateEntries(256, [11, 12, 13, 27]);
+    const b2 = immediateEntries(258, [4, 5, 6, 9, 14, 15, 21, 40]);
+    return {
+      id: 1, name: 'transfer', scheduled: false,
+      buckets: [
+        bucketOf(1, 1, 256, b0.length, b0),
+        bucketOf(1, 1, 257, 0, []),                       // drained, not retired
+        bucketOf(1, 1, 258, Math.min(3 + n, b2.length), b2.slice(0, Math.min(3 + n, b2.length))),
+      ],
+    };
+  })();
+
+  const shard1Timer = {
+    id: 2, name: 'timer', scheduled: true,
+    buckets: [
+      (() => {
+        const e = scheduledEntries(MINUTE0, [[3, 1048591], [17, 1048604]]);
+        return bucketOf(1, 2, MINUTE0, e.length, e);
+      })(),
+      bucketOf(1, 2, MINUTE0 + 1, 0, []),                 // drained, not retired
+      (() => {
+        const e = scheduledEntries(MINUTE0 + 2, [
+          [0, 1056771], [6, 1056772], [6, 1056918], [31, 1057004], [58, 1057130],
+        ]);
+        return bucketOf(1, 2, MINUTE0 + 2, e.length, e);
+      })(),
+    ],
+  };
+
+  const shard3Transfer = (() => {
+    const hot   = immediateEntries(1024, [0, 1, 2, 3, 4, 5, 6, 7]);
+    const fresh = immediateEntries(1025, [2, 3, 8, 19]);
+    return {
+      id: 1, name: 'transfer', scheduled: false,
+      buckets: [
+        bucketOf(3, 1, 1024, 1042 + n * 3, hot),          // far past the entry cap
+        bucketOf(3, 1, 1025, fresh.length, fresh),
+      ],
+    };
+  })();
+
+  const shard3Timer = {
+    id: 2, name: 'timer', scheduled: true,
+    buckets: [
+      (() => {
+        const e = scheduledEntries(MINUTE0 + 1, [[12, 4194329], [12, 4194330], [44, 4194411]]);
+        return bucketOf(3, 2, MINUTE0 + 1, e.length, e);
+      })(),
+    ],
+  };
+
+  const shard3Visibility = (() => {
+    const e = immediateEntries(1024, [9, 22]);
+    return {
+      id: 4, name: 'visibility', scheduled: false,
+      buckets: [bucketOf(3, 4, 1024, e.length, e)],
+    };
+  })();
+
+  return {
+    bucketing: {
+      immediateShift: IMMEDIATE_SHIFT,
+      scheduledBucketSeconds: SCHEDULED_BUCKET_SECONDS,
+    },
+    shards: [
+      { shardId: 1, categories: [shard1Transfer, shard1Timer] },
+      { shardId: 3, categories: [shard3Transfer, shard3Timer, shard3Visibility] },
+    ],
+  };
+}
+
+/* Objects in the namespace: a plausible number that climbs with the demo. */
+const totalObjects = () => 26 + world.runs * 14;
+
+/* ── deterministic fake ids ────────────────────────────────────────────── */
 
 function hexPreview(seed, bytes = 12) {
   let x = seed * 2654435761 % 4294967296;
@@ -63,93 +183,6 @@ function hexPreview(seed, bytes = 12) {
 }
 
 const digest = (seed) => hexPreview(seed + 7777, 10).replace(/ |…/g, '').slice(0, 20);
-
-const NS_ID  = 'a4f1c2d0-9e33-4b6a-8f21-6d0e5b7c1a99';
-const TREE   = '3f7b1e02-55c4-4a7d-9d1b-2c8e40aa77b1';
-const BRANCH = '9c0a6d18-1b42-4f83-bb27-70e5c3d92f04';
-
-function recordsFor(set) {
-  const n = setCount(set);
-  if (n === 0) return [];
-  const out = [];
-  const cap = Math.min(n, 25);
-  for (let i = 0; i < cap; i++) out.push(makeRecord(set.name, i));
-  return out;
-}
-
-function makeRecord(name, i) {
-  const s = i + 1;
-  const wf  = `hello-workflow-${String((i % Math.max(world.runs, 1)) + 1).padStart(3, '0')}`;
-  const run = `${digest(i * 3 + 1).slice(0, 8)}-4b2f-4c11-9a7e-${digest(i * 5 + 2).slice(0, 12)}`;
-  const B = (nm, size, seed) => ({ name: nm, type: 'blob', preview: hexPreview(seed, 12), size });
-  const I = (nm, v) => ({ name: nm, type: 'int', preview: String(v), size: 8 });
-  const S = (nm, v) => ({ name: nm, type: 'str', preview: v, size: v.length });
-  const M = (nm, entries, size) => ({ name: nm, type: 'map(k-ordered)', preview: entries, size });
-  const L = (nm, v, size) => ({ name: nm, type: 'list', preview: v, size });
-
-  switch (name) {
-    case 'shard':
-      return { key: String(i + 1), digest: digest(s), bins: [
-        I('range_id', 12 + i), B('info', 486 + i * 13, s * 11), S('enc', 'Proto3') ] };
-
-    case 'exec':
-      return { key: `${(i % 4) + 1}:${NS_ID}:${wf}:${run}`, digest: digest(s * 2), bins: [
-        B('info',  1204 + i * 37, s * 17),
-        B('state', 3312 + i * 91, s * 23),
-        I('next_id', 11 + i), I('ver', 3 + (i % 4)), I('csum', 1849302 + i),
-        M('act',  '{ 5 → blob(214 B) }', 214),
-        M('tmr',  '{ }', 0),
-        M('chld', '{ }', 0),
-        L('buf',  '[ ]', 0) ] };
-
-    case 'curr':
-      return { key: `${(i % 4) + 1}:${NS_ID}:${wf}`, digest: digest(s * 3), bins: [
-        S('run_id', run), I('state', 2), I('status', 2), I('lwv', 7 + i),
-        I('start_time', 1757251200000 + i * 1000), L('req_ids', '[ "req-1" ]', 24) ] };
-
-    case 'htask':
-      return { key: `${(i % 4) + 1}:${(i % 3) + 1}:${Math.floor(i / 3)}`, digest: digest(s * 5), bins: [
-        M('t', `{ ${1048576 + i * 7} → blob(168 B), ${1048577 + i * 7} → blob(171 B) }`, 339) ] };
-
-    case 'hnode':
-      return { key: `${TREE}:${BRANCH}:${i + 1}:${1000 + i}`, digest: digest(s * 7), bins: [
-        B('events', 742 + i * 211, s * 29), S('enc', 'Proto3') ] };
-
-    case 'hbranch':
-      return { key: `${TREE}:${BRANCH}`, digest: digest(s * 11), bins: [
-        B('info', 312, s * 31),
-        M('idx', '{ 0x0000000000000001…7ffffffffffffc17 → 1000, … }', 96) ] };
-
-    case 'htree':
-      return { key: TREE, digest: digest(s * 13), bins: [
-        M('br', `{ ${BRANCH} → blob(288 B) }`, 288) ] };
-
-    case 'tq':
-      return { key: `${NS_ID}:hello-task-queue:${i + 1}`, digest: digest(s * 17), bins: [
-        I('range_id', 3 + i), B('info', 214, s * 37), B('user_data', 96, s * 41), I('ud_version', 1) ] };
-
-    case 'task':
-      return { key: `${NS_ID}:hello-task-queue:1:${i}`, digest: digest(s * 19), bins: [
-        M('t', `{ ${2097152 + i * 3} → blob(142 B) }`, 142) ] };
-
-    case 'ns':
-      return i === 0
-        ? { key: NS_ID, digest: digest(s * 23), bins: [
-            B('detail', 918, s * 43), I('notification_version', 4), S('name', 'demo') ] }
-        : { key: `name:${i === 1 ? 'demo' : 'temporal-system'}`, digest: digest(s * 29), bins: [
-            S('id', NS_ID) ] };
-
-    case 'nsmeta':
-      return { key: 'metadata', digest: digest(s * 31), bins: [ I('notification_version', 4) ] };
-
-    case 'clustermeta':
-      return { key: i === 0 ? 'active' : 'membership:history:1', digest: digest(s * 37), bins: [
-        B('data', 462 + i * 20, s * 47), I('version', 2), S('enc', 'Proto3') ] };
-
-    default:
-      return { key: `${name}-${i}`, digest: digest(s * 41), bins: [ B('data', 128, s) ] };
-  }
-}
 
 /* ── event bus (fake SSE) ──────────────────────────────────────────────── */
 
@@ -250,6 +283,40 @@ function runSwitch() {
   }, T(15400));
 }
 
+/* ── the scripted reset ────────────────────────────────────────────────── */
+
+const RESET_STEPS = [
+  [   0, 'progress', 'Stopping the demo worker'],
+  [ 900, 'progress', 'Truncating Aerospike sets — htask, htaskidx, exec, curr, hnode, hbranch, htree, task, tq, ns'],
+  [2600, 'progress', 'Durable deletes flushed — namespace "temporal" is empty'],
+  [3200, 'state',    'Rewriting persistence config: default store -> sqlite'],
+  [3600, 'progress', 'Restarting temporal-server on the built-in SQLite store…'],
+  // server goes away here
+  [8200, 'progress', 'temporal-server up — frontend, history, matching, worker'],
+  [8900, 'progress', 'Namespace "demo" registered'],
+  [9400, 'state',    'Persistence store is sqlite. Demo is back at step 1.'],
+];
+
+const RESET_DOWN_FROM = 3900;
+const RESET_DOWN_TO   = 7900;
+
+function runReset() {
+  world.switching = true;
+  world.temporalReady = false;
+
+  for (const [at, type, msg] of RESET_STEPS) setTimeout(() => emit(type, msg), T(at));
+
+  setTimeout(() => { world.serverDown = true; dropAllStreams(); }, T(RESET_DOWN_FROM));
+  setTimeout(() => { world.serverDown = false; }, T(RESET_DOWN_TO));
+
+  setTimeout(() => {
+    world.backend = 'sqlite';
+    world.switching = false;
+    world.temporalReady = true;
+    world.runs = 0;
+  }, T(9400));
+}
+
 /* ── fake fetch ────────────────────────────────────────────────────────── */
 
 const json = (body, status = 200) =>
@@ -286,16 +353,25 @@ async function mockFetch(input, init = {}) {
     return new Response('', { status: 202 });
   }
 
+  if (path === '/api/reset' && method === 'POST') {
+    if (world.switching) return json({ error: 'switch in progress' }, 409);
+    runReset();
+    return new Response('', { status: 202 });
+  }
+
   if (path === '/api/workflow/run' && method === 'POST') {
     if (world.switching) return json({ error: 'switch in progress' }, 503);
     await sleep(500 + Math.random() * 700);
     world.runSeq++;
-    if (world.backend === 'aerospike') world.runs++;
+    const store = world.backend;
+    if (store === 'aerospike') world.runs++;
     return json({
       workflowId: `hello-workflow-${String(world.runSeq).padStart(3, '0')}`,
       runId: `${digest(world.runSeq).slice(0, 8)}-4b2f-4c11-9a7e-${digest(world.runSeq * 3).slice(0, 12)}`,
-      result: `Hello world, from ${world.backend === 'aerospike' ? 'Aerospike' : 'SQLite'}`,
+      // The activity itself names the store it ran on.
+      result: `Hello world, from ${store === 'aerospike' ? 'Aerospike' : 'SQLite'}`,
       durationMs: 420 + Math.floor(Math.random() * 380),
+      persistenceStore: store,
     });
   }
 
@@ -310,17 +386,17 @@ async function mockFetch(input, init = {}) {
     });
   }
 
-  if (path === '/api/aerospike/sets') {
-    if (world.backend !== 'aerospike') return json([]);
-    return json(SETS.map((s) => ({ name: s.name, objects: setCount(s), description: s.description })));
-  }
-
-  if (path === '/api/aerospike/records') {
-    const name = url.searchParams.get('set');
-    const limit = Number(url.searchParams.get('limit')) || 25;
-    const set = SETS.find((s) => s.name === name);
-    if (!set || world.backend !== 'aerospike') return json([]);
-    return json(recordsFor(set).slice(0, limit));
+  if (path === '/api/aerospike/history-tasks') {
+    if (world.backend !== 'aerospike') {
+      return json({
+        bucketing: {
+          immediateShift: IMMEDIATE_SHIFT,
+          scheduledBucketSeconds: SCHEDULED_BUCKET_SECONDS,
+        },
+        shards: [],
+      });
+    }
+    return json(historyTasks());
   }
 
   return json({ error: 'not found' }, 404);

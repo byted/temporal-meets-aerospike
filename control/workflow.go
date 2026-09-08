@@ -59,6 +59,11 @@ type RunResult struct {
 	RunID      string `json:"runId"`
 	Result     string `json:"result"`
 	DurationMs int64  `json:"durationMs"`
+	// PersistenceStore is the store this run actually executed against, as
+	// reported by the server to the activity while it ran. It is deliberately
+	// not read from /api/state: that is a poll of the Deployment's desired
+	// configuration, whereas this is a fact about this execution.
+	PersistenceStore string `json:"persistenceStore"`
 }
 
 func NewWorkflowRunner(cfg Config, logger *slog.Logger) *WorkflowRunner {
@@ -205,16 +210,17 @@ func (r *WorkflowRunner) Run(ctx context.Context) (*RunResult, error) {
 		return nil, fmt.Errorf("starting demo workflow: %w", err)
 	}
 
-	var result string
+	var result e2e.GreetResult
 	if err := run.Get(ctx, &result); err != nil {
 		return nil, fmt.Errorf("demo workflow %s did not complete: %w", run.GetID(), err)
 	}
 
 	return &RunResult{
-		WorkflowID: run.GetID(),
-		RunID:      run.GetRunID(),
-		Result:     result,
-		DurationMs: time.Since(started).Milliseconds(),
+		WorkflowID:       run.GetID(),
+		RunID:            run.GetRunID(),
+		Result:           result.Greeting,
+		DurationMs:       time.Since(started).Milliseconds(),
+		PersistenceStore: result.PersistenceStore,
 	}, nil
 }
 

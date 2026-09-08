@@ -91,10 +91,17 @@ spec:
             periodSeconds: 5
             failureThreshold: 60
           readinessProbe:
-            tcpSocket:
-              port: grpc
-            periodSeconds: 10
+            # A gRPC health check, not a tcpSocket probe. The port opens before
+            # the services behind it are usable, so a socket probe reports ready
+            # while history is still claiming shards and matching is still
+            # coming up. The control plane then registers a namespace and starts
+            # a workflow into that window, which is precisely the race that made
+            # the first run after a switch stall.
+            grpc:
+              port: 7233
+            periodSeconds: 5
             timeoutSeconds: 3
+            failureThreshold: 30
           livenessProbe:
             tcpSocket:
               port: grpc
