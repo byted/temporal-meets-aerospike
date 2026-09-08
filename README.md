@@ -1,7 +1,8 @@
-****# temporal-meets-aerospike
+# temporal-meets-aerospike
 
 A proof of concept using **Aerospike** as the operational persistence store for
-**Temporal Server**. Visibility stays on Elasticsearch — only the operational store is replaced.
+**Temporal Server**. Only the operational store is replaced; visibility is left alone — on
+Elasticsearch in the compose stack, on SQLite in the hosted demo.
 
 Temporal ships Cassandra, MySQL and PostgreSQL stores. Aerospike has never been attempted; the
 only prior art is a [2021 forum thread](https://community.temporal.io/t/aerospike-as-persistence-layer/1829)
@@ -90,13 +91,14 @@ Temporal's own persistence conformance suites, run against a live Aerospike node
 | `ExecutionMutableStateTaskSuite` | 15 |
 | `HistoryEventsSuite` | 12 |
 | `TaskQueueSuite` / `TaskQueueTaskSuite` / `TaskQueueFairTaskSuite` / `TaskQueueUserDataSuite` | 18 |
-| `QueueV2` + `HistoryTaskQueueManager` | 33 |
-| `NexusEndpoint` | 9 |
+| `QueueV2` + `HistoryTaskQueueManager` | 39 |
+| `NexusEndpoint` | 8 |
 | `MetadataPersistenceSuiteV2` | 22 |
 | `HistoryV2PersistenceSuite` | 5 |
 | `ClusterMetadataManagerSuite` | 7 |
 | Aerospike capability checks (ours) | 6 |
-| **Total** | **175 passing, 0 failing** |
+| Store configuration checks (ours) | 8 |
+| **Total** | **189 passing, 0 failing** |
 
 And the thing that actually matters — a workflow with an activity, start to finish:
 
@@ -106,10 +108,29 @@ $ temporal operator cluster describe
   active       aerospike         elasticsearch
 
 $ go test ./e2e/ -v
-    workflow started: id=85503329-3053-46ed-9bf2-bacbe4889498
-    workflow completed: Hello world, from Aerospike
---- PASS: TestWorkflowWithActivity
+    workflow started: id=8d599064-6953-49d5-bdbf-5e9c4b4989d3 run=01a07f08-89f4-764e-8656-e77b77c217c3
+    workflow completed on aerospike: Hello world, from Aerospike
+--- PASS: TestWorkflowWithActivity (10.15s)
 ```
+
+The activity does not hardcode that name: it asks the server which store it is running on and puts
+the answer in the greeting, so the workflow's own output is the evidence. The ten seconds are a
+deliberate `workflow.Sleep` — a durable timer is the only thing that exercises the *scheduled* task
+path, which is where the interesting data modelling lives.
+
+## The demo
+
+A web control plane runs the whole story end to end: start on SQLite, run a workflow, switch the
+persistence store to Aerospike while the stack restarts underneath, run the identical workflow
+again, then browse the actual Aerospike records behind it.
+
+The task-queue view is the point — it renders the bucketed, K-ordered maps that stand in for
+Cassandra's clustered partitions, so the central trick of the data model is something you can look
+at rather than something you have to take on faith.
+
+Deploys to a single-node k3s box with Traefik, cert-manager and basic auth in front of everything.
+See [`deploy/k8s/README.md`](deploy/k8s/README.md) for the full walkthrough and
+[06 — Demo control plane](docs/06-demo-control-plane.md) for the design.
 
 ## Documentation
 
@@ -152,9 +173,18 @@ cluster reclustered — that is what `roster-init` does, and why the server wait
 ## Licensing caveat
 
 Strong consistency, multi-record transactions and durable deletes are Enterprise-only features. The
-Enterprise container image ships a perpetual single-node evaluation key, governed by the
-[Aerospike Evaluation License](https://aerospike.com/legal/evaluation-license-agreement/):
-evaluation and development only, **not for production use**.
+Enterprise container image ships a perpetual single-node evaluation key, governed by Aerospike's
+evaluation terms: **evaluation and development only, not production**.
 
-This makes the PoC free and legal, and it bounds the conclusion — an Aerospike-backed Temporal
+That makes the PoC free and legal, and it bounds the conclusion — an Aerospike-backed Temporal
 would only be usable by Aerospike Enterprise customers.
+
+There is a second consequence that is easy to miss, and it applies directly to this repository
+being public: the evaluation terms **restrict publishing benchmarks or comparative studies**. This
+project is a comparative study, and Iteration 2 is explicitly about producing performance numbers
+against a Cassandra baseline — so that constrains what may be published here.
+
+Read the licensing section of
+[02 — Aerospike capabilities](docs/02-aerospike-capabilities.md) before publishing any measurements.
+It carries the verbatim clauses and their source; the summary above is deliberately not a quotation,
+because an earlier draft of this repo mis-attributed one, and that correction is recorded there too.

@@ -10,7 +10,7 @@
 #
 # There is a licensing dimension too: the Aerospike evaluation terms limit
 # access to people with a need to have it, so an open demo box is outside the
-# grant. See docs/07-hosting-options.md.
+# grant. See docs/02-aerospike-capabilities.md.
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:

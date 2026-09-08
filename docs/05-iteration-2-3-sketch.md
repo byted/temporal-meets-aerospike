@@ -77,6 +77,6 @@ prohibit publishing benchmarking or comparative studies (Evaluation License §3.
 Subscription Agreement §7.4(e)). Iteration 2 exists to produce exactly such numbers. Measuring
 privately to inform a decision is one thing; publishing a Cassandra-versus-Aerospike comparison is
 another, and that needs settling with Aerospike before the work is done rather than after. See
-[07-hosting-options.md](07-hosting-options.md).
+[02-aerospike-capabilities.md](02-aerospike-capabilities.md).
 
 Question 3 needs no code and can be answered at any time.

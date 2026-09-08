@@ -338,7 +338,7 @@ moment a caller asks for the whole key space, which Temporal does when draining 
 `[0, MaxInt64)` is 2^51 buckets. It surfaced as a client timeout, not as an obvious logic error.
 
 Fixed with a per-(shard, category) index record listing populated buckets. See
-[03-data-model.md](03-data-model.md#a-bucket-index-is-mandatory-not-an-optimisation).
+[03-data-model.md](03-data-model.md#bucketing).
 
 Three further bugs from the same phase, all worth remembering:
 

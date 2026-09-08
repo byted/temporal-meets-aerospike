@@ -34,8 +34,56 @@ Two consequences, and the second one is easy to miss:
    explicitly about producing performance numbers against a Cassandra baseline — so this constrains
    what may be published, independently of where the demo is hosted.
 
-See [07-hosting-options.md](07-hosting-options.md) for the full licence analysis with verbatim
-clauses and current source URLs.
+### The evaluation licence, verbatim
+
+The image's own README states: *"If you are using the Aerospike Database Enterprise Edition
+evaluation feature key file, you are operating under the Aerospike Evaluation License Agreement"*
+([Docker Hub](https://hub.docker.com/r/aerospike/aerospike-server-enterprise)). That agreement is
+short; the clauses that bear on this project:
+
+> **1.2** Company hereby grants to Licensee a non-exclusive, non-transferable, nonsublicensable
+> limited license (the "License") to use the Products **internally only for Evaluation purposes only
+> during the Evaluation Period**.
+
+> **3.1** … Licensee may use the Products in machine-readable form only and agrees not to (and not to
+> allow any third party to): … (iii) **provide, lease, lend, disclose, use for timesharing or service
+> bureau purposes**, (iv) **use the Product for the purpose of publishing or disclosing to any third
+> party any benchmarking or comparative study involving any Product**, or otherwise use or allow
+> others to use for the benefit of any third party, any Product.
+
+> **5.** … Proprietary Information [includes] the Products … Licensee agrees: (i) not to divulge to
+> any third person any such Proprietary Information, (ii) to give access to such Proprietary
+> Information **solely to those employees with a need to have access thereto** for purposes of this
+> Agreement…
+
+> **7.** Either Company or Licensee may terminate this Agreement at any time with or without cause.
+
+(Emphasis added. Source: the Evaluation License Agreement PDF served from Aerospike's EULA endpoint,
+[d7umqicpi7263.cloudfront.net/eula/fRV3ImIV-c9pAt5P_b5uUdeo7z6UwjevV6tOdD9BPR8](https://d7umqicpi7263.cloudfront.net/eula/fRV3ImIV-c9pAt5P_b5uUdeo7z6UwjevV6tOdD9BPR8),
+retrieved 7 Sep 2026. Governed by California law, §8.)
+
+**Read plainly, and not as legal advice — this is reading the text, not advising on it:**
+
+- **It permits** running the single-node Enterprise image on any box you control, for your own
+  evaluation and development, for as long as the Evaluation Period lasts.
+- **It does not permit an open, publicly reachable demo.** §1.2's "internally only" and §5's
+  restriction of access to "those employees with a need to have access" are not ambiguous about
+  strangers hitting a URL — a public demo box is outside the grant, not in a grey area. What fits is
+  a box behind the basic-auth credential the deployment creates
+  ([deploy/k8s/README.md](../deploy/k8s/README.md)), shown to named people.
+- **§3.1(iv) is the clause that bites this project**, and it is easy to miss because it is about
+  publishing rather than hosting. Publishing latency or throughput numbers from Iteration 2 to any
+  third party is what it prohibits, in terms.
+- **"Perpetual feature key" is not "perpetual licence."** The key does not expire; the grant is
+  bounded by an "Evaluation Period" the agreement uses but never defines, and §7 lets Aerospike
+  terminate at will. Treat any demo box as revocable.
+
+What could not be determined: whether Aerospike would object in practice to a credential-gated demo
+box (no public statement either way); the length of the "Evaluation Period" (§1.2 bounds the grant
+by it, the agreement never defines it); and which Aerospike document is currently authoritative —
+both `aerospike.com/legal/evaluation-license-agreement/` and the download-trial URL rendered the
+Master Subscription Agreement when fetched on 7 Sep 2026, so the verbatim text above came from the
+CloudFront EULA endpoint and could not be confirmed as current from Aerospike's own site.
 
 ## Strong consistency
 
