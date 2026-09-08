@@ -9,6 +9,13 @@
 # Path routing, not prefix stripping: /temporal reaches ui-server *with* the
 # prefix intact, and ui-server is told about it via TEMPORAL_UI_PUBLIC_PATH.
 # Traefik orders ingress rules by matcher specificity, so /temporal wins over /.
+#
+# `temporal-meets-aerospike.example.com` below is a placeholder -- example.com is
+# reserved by RFC 2606 and will never resolve. Substitute a hostname whose A
+# record already points at the box: cert-manager asks Let's Encrypt to validate
+# it over HTTP-01, so DNS has to be correct *before* this is applied or the
+# challenge fails and burns rate limit. It appears twice, and both must match.
+# Set the ACME contact address in 46-cert-manager-issuers.yaml at the same time.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

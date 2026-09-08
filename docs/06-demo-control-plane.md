@@ -149,6 +149,7 @@ canned data with `?mock=1` — see `control/web/mock/`.
 On a box: [deploy/k8s/README.md](../deploy/k8s/README.md), which documents the Civo deployment
 including k3s install, native image builds, both credentials, and TLS via cert-manager.
 
-Deployed at `https://temporal-meets-aerospike.example.com` behind basic auth, with a Let's
-Encrypt certificate and an HTTP-to-HTTPS redirect ahead of the auth middleware, so credentials are
-never requested over plaintext.
+Deployed behind basic auth on a hostname of your choosing — the manifests carry
+`temporal-meets-aerospike.example.com` as a placeholder — with a Let's Encrypt certificate and an
+HTTP-to-HTTPS redirect ahead of the auth middleware, so credentials are never requested over
+plaintext.
